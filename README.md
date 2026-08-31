@@ -1,13 +1,13 @@
 # Elgato 4K60 Pro MK.2 (1cfa:000e) and Elgato 4K Pro (1cfa:0012) Linux Driver
 
-[![Kernel Compatibility](https://img.shields.io/badge/Kernel-6.12%20--%207.0%2B-blueviolet)](https://github.com/Nakildias/sc0710)
+[![Kernel Compatibility](https://img.shields.io/badge/Kernel-6.12%20--%207.0%2B-blueviolet)](https://github.com/ocguilherme/4k-elgato)
 [![AUR version](https://img.shields.io/aur/version/sc0710-dkms-git?logo=arch-linux)](https://aur.archlinux.org/packages/sc0710-dkms-git)
 [![Status](https://img.shields.io/badge/Status-Maintained-success)](#)
-[![GitHub last commit](https://img.shields.io/github/last-commit/Nakildias/sc0710)](https://github.com/Nakildias/sc0710/commits/main)
+[![GitHub last commit](https://img.shields.io/github/last-commit/ocguilherme/4k-elgato)](https://github.com/ocguilherme/4k-elgato/commits/main)
 
-[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://github.com/Nakildias/sc0710/blob/main/LICENSE)
-[![GitHub stars](https://img.shields.io/github/stars/Nakildias/sc0710?style=flat)](https://github.com/Nakildias/sc0710/stargazers)
-[![GitHub issues](https://img.shields.io/github/issues/Nakildias/sc0710)](https://github.com/Nakildias/sc0710/issues)
+[![License: GPL v2](https://img.shields.io/badge/License-GPL%20v2-blue.svg)](https://github.com/ocguilherme/4k-elgato/blob/main/LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/ocguilherme/4k-elgato?style=flat)](https://github.com/ocguilherme/4k-elgato/stargazers)
+[![GitHub issues](https://img.shields.io/github/issues/ocguilherme/4k-elgato)](https://github.com/ocguilherme/4k-elgato/issues)
 
 High-performance, multi-client Linux driver for the Elgato 4K60 Pro MK.2 and Elgato 4K Pro PCI-e capture cards. Engineered for stability on modern kernels (6.12 through 7.0+).
 
@@ -41,7 +41,7 @@ Tested on kernel **6.12 through 7.0+**. Newer kernels may work but are not guara
 Unified installer — auto-detects atomic vs standard distros. Supported on Arch, Debian/Ubuntu, Fedora, and Fedora Atomic (Bazzite, Silverblue, Bluefin, Aurora).
 
 ```bash
-sudo bash -c "$(curl -fsSL [https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh](https://raw.githubusercontent.com/ocguilherme/4k-elgato/refs/heads/main/scripts/install-sc0710.sh?token=GHSAT0AAAAAAEHC44FAZOHH56V5UZYHMPNS2UVWKVQ))"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/ocguilherme/4k-elgato/main/scripts/install-sc0710.sh)"
 ```
 
 **Standard distros** get DKMS (optional) or a manual module build, `sc0710-cli`, and boot-time module loading via `modules-load.d`.
@@ -103,17 +103,17 @@ sudo sc0710-cli --restart
 
 **Upgrading from an older package version** — old versions created `sc0710-firmware.service`/`sc0710-firmware-verify.service` outside the package (the driver programs the ECP5 itself now, so they no longer exist). The package upgrade removes those leftovers automatically; the [removal check script](#verify-complete-removal) flags any stragglers.
 
-**4K Pro on Arch** — the maintainer primarily tests on MK.2 hardware. Cold-boot ECP5 reports from 4K Pro users are especially welcome ([open an issue](https://github.com/Nakildias/sc0710/issues) with `sc0710-cli --dump`).
+**4K Pro on Arch** — the maintainer primarily tests on MK.2 hardware. Cold-boot ECP5 reports from 4K Pro users are especially welcome ([open an issue](https://github.com/ocguilherme/4k-elgato/issues) with `sc0710-cli --dump`).
 
 ### NixOS (flakes)
 
-Add `github:Nakildias/sc0710` as a flake input and import `sc0710.nixosModules.default`:
+Add `github:ocguilherme/4k-elgato` as a flake input and import `sc0710.nixosModules.default`:
 
 ```nix
 {
   inputs = {
     # ...
-    sc0710.url = "github:Nakildias/sc0710";
+    sc0710.url = "github:ocguilherme/4k-elgato";
   };
 
   outputs = { self, nixpkgs, sc0710 }: {
@@ -147,7 +147,7 @@ For development or unsupported distros.
 
 2. **Build and load**
    ```bash
-   git clone https://github.com/Nakildias/sc0710
+   git clone https://github.com/ocguilherme/4k-elgato
    cd sc0710
    make
    sudo insmod build/sc0710.ko
@@ -181,7 +181,7 @@ Installed by the automatic installer, the AUR package, and the NixOS module. Pro
 After `sc0710-cli --remove`, verify everything is gone:
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/check-sc0710-removal.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/ocguilherme/4k-elgato/main/scripts/check-sc0710-removal.sh)"
 ```
 
 ### Verify complete removal
@@ -355,7 +355,7 @@ Contributions and testing help are especially welcome for:
 * **Unsupported cards** — other `12ab:0710` subsystem IDs (e.g. HD60 Pro) that are not yet fully supported
 * **Open issues** — bugs that need reproduction on hardware the maintainer does not own (4K60 tearing, edge-case distros, etc.)
 
-If you can test, debug, or submit patches for any of the above, please [open an issue](https://github.com/Nakildias/sc0710/issues) or a pull request. Include `sc0710-cli --dump` output when reporting problems.
+If you can test, debug, or submit patches for any of the above, please [open an issue](https://github.com/ocguilherme/4k-elgato/issues) or a pull request. Include `sc0710-cli --dump` output when reporting problems.
 
 ## Credits and copyright
 

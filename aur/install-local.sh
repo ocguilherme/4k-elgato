@@ -178,7 +178,7 @@ msg "Preparing local build in ${BUILD_DIR}"
 cp "$SCRIPT_DIR/PKGBUILD" "$SCRIPT_DIR/sc0710.install" "$BUILD_DIR/"
 
 LOCAL_SOURCE="git+file://${REPO_ROOT}#branch=${BRANCH}"
-sed -i "s|^source=(\"git+https://github.com/Nakildias/sc0710.git\")|source=(\"${LOCAL_SOURCE}\")|" \
+sed -i "s|^source=(.*)|source=(\"${LOCAL_SOURCE}\")|" \
     "$BUILD_DIR/PKGBUILD"
 
 msg "Building branch ${BRANCH} from ${REPO_ROOT}"

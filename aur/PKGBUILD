@@ -5,7 +5,7 @@ pkgver=2026.06.16.1.r143.f0fb40d
 pkgrel=4
 pkgdesc="DKMS driver for Elgato 4K60 Pro MK.2 & 4K Pro (sc0710) capture cards"
 arch=('x86_64')
-url="https://github.com/Nakildias/sc0710"
+url="https://github.com/ocguilherme/4k-elgato"
 license=('GPL-2.0-or-later')
 depends=('dkms')
 optdepends=('p7zip: ECP5 firmware extraction for Elgato 4K Pro')
@@ -13,7 +13,7 @@ makedepends=('git')
 provides=("${_pkgname}-dkms" "${_pkgname}-cli" "elgato-4k60pro-mk2-driver" "elgato-4k60pro-mk2-dkms" "elgato-4kpro-driver" "elgato-4kpro-dkms")
 conflicts=("${_pkgname}-dkms" "${_pkgname}")
 install=${_pkgname}.install
-source=("git+https://github.com/Nakildias/sc0710.git")
+source=("${_pkgname}::git+https://github.com/ocguilherme/4k-elgato.git")
 sha256sums=('SKIP')
 
 pkgver() {

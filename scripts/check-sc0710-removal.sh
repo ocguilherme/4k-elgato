@@ -9,7 +9,7 @@
 #
 # Usage:
 #   bash check-sc0710-removal.sh
-#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/check-sc0710-removal.sh)"
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/ocguilherme/4k-elgato/main/scripts/check-sc0710-removal.sh)"
 
 set -uo pipefail
 

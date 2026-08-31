@@ -492,7 +492,7 @@ def open_config(kind):
     return True, None
 
 
-VERSION_URL = "https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
+VERSION_URL = "https://raw.githubusercontent.com/ocguilherme/4k-elgato/main/version"
 
 
 def local_version():

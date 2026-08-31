@@ -7,7 +7,7 @@ set -e
 
 # Define variables
 AUR_REPO_URL="ssh://aur@aur.archlinux.org/sc0710-dkms-git.git"
-MAIN_REPO_URL="https://github.com/Nakildias/sc0710.git"
+MAIN_REPO_URL="https://github.com/ocguilherme/4k-elgato.git"
 WORK_DIR="/tmp/sc0710_deploy"
 MAIN_DIR="$WORK_DIR/main"
 AUR_DIR="$WORK_DIR/aur"

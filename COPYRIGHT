@@ -15,7 +15,7 @@ Original driver
 This fork
 ---------
   Copyright (c) 2025-2026 Nakildias <nakildiaspro@gmail.com>
-  https://github.com/Nakildias/sc0710
+  https://github.com/ocguilherme/4k-elgato
 
   Maintains and extends the driver for the Elgato 4K60 Pro MK.2 and
   Elgato 4K Pro on modern kernels (6.12+), including 4K Pro ECP5 FPGA

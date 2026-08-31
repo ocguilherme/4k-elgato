@@ -6,7 +6,7 @@
 # Detects distro type at runtime and branches accordingly.
 
 # --- Configuration ---
-VERSION_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
+VERSION_URL="https://raw.githubusercontent.com/ocguilherme/4k-elgato/main/version"
 DRV_NAME="sc0710"
 
 # --- Colors ---
@@ -2056,7 +2056,7 @@ case "$1" in
         if [[ "$IS_ATOMIC" == "true" ]]; then
             [[ ! -d "$SRC_DIR" ]] && { echo -e "${RED}[ERROR]${NC} Source directory missing."; exit 1; }
             TEMP_TAR=$(mktemp /tmp/sc0710-update.XXXXXX.tar.gz)
-            curl -fsSL "https://github.com/Nakildias/sc0710/archive/refs/heads/main.tar.gz" -o "$TEMP_TAR" || { echo -e "${RED}[ERROR]${NC} Download failed."; rm -f "$TEMP_TAR"; exit 1; }
+            curl -fsSL "https://github.com/ocguilherme/4k-elgato/archive/refs/heads/main.tar.gz" -o "$TEMP_TAR" || { echo -e "${RED}[ERROR]${NC} Download failed."; rm -f "$TEMP_TAR"; exit 1; }
             tar -xzf "$TEMP_TAR" --strip-components=1 -C "$SRC_DIR" || { rm -f "$TEMP_TAR"; exit 1; }
             rm -f "$TEMP_TAR"
             [[ -f "$SRC_DIR/scripts/build-and-load.sh" ]] && cp "$SRC_DIR/scripts/build-and-load.sh" "$SRC_DIR/build-and-load.sh" && chmod +x "$SRC_DIR/build-and-load.sh"
@@ -2091,7 +2091,7 @@ case "$1" in
                     fi
                 else
                     echo -e "${YELLOW}[WARNING]${NC} Try: sc0710-cli --load"
-                    [[ ! -f "$SRC_DIR/build/${DRV_NAME}.ko" ]] && echo -e "   ${YELLOW}If module doesn't exist, please reinstall using:${NC}" && echo -e "   sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh)\""
+                    [[ ! -f "$SRC_DIR/build/${DRV_NAME}.ko" ]] && echo -e "   ${YELLOW}If module doesn't exist, please reinstall using:${NC}" && echo -e "   sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/ocguilherme/4k-elgato/main/scripts/install-sc0710.sh)\""
                 fi
             else
                 echo -e "${RED}[ERROR]${NC} Build failed."
@@ -2102,7 +2102,7 @@ case "$1" in
             TEMP_DIR=$(mktemp -d /tmp/sc0710-update.XXXXXX)
             TEMP_TAR="$TEMP_DIR/main.tar.gz"
             
-            curl -fsSL "https://github.com/Nakildias/sc0710/archive/refs/heads/main.tar.gz" -o "$TEMP_TAR" || { rm -rf "$TEMP_DIR"; exit 1; }
+            curl -fsSL "https://github.com/ocguilherme/4k-elgato/archive/refs/heads/main.tar.gz" -o "$TEMP_TAR" || { rm -rf "$TEMP_DIR"; exit 1; }
             tar -xzf "$TEMP_TAR" --strip-components=1 -C "$TEMP_DIR" || { rm -rf "$TEMP_DIR"; exit 1; }
             rm -f "$TEMP_TAR"
             

@@ -17,7 +17,7 @@ if [[ $EUID -ne 0 ]]; then
     if [[ -f "$0" ]]; then
         exec sudo bash "$(realpath "$0")" "$@"
     else
-        echo "Please run with: sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/ocguilherme/4k-elgato/refs/heads/main/scripts/install-sc0710.sh)\""
+        echo "Please run with: sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/ocguilherme/4k-elgato/main/scripts/install-sc0710.sh)\""
         exit 1
     fi
 fi
@@ -95,7 +95,7 @@ looks_like_steamos() {
     return 1
 }
 
-STEAMOS_LIB_URL="https://raw.githubusercontent.com/ocguilherme/4k-elgato/refs/heads/main/scripts/sc0710-steamos-lib.sh"
+STEAMOS_LIB_URL="https://raw.githubusercontent.com/ocguilherme/4k-elgato/main/scripts/sc0710-steamos-lib.sh"
 
 source_steamos_lib() {
     local cand tmp
@@ -128,7 +128,7 @@ if looks_like_steamos; then
     else
         echo "error: SteamOS detected but scripts/sc0710-steamos-lib.sh could not be loaded."
         echo "       Clone the repo and run it locally:"
-        echo "         git clone https://raw.githubusercontent.com/ocguilherme/4k-elgato.git"
+        echo "         git clone https://github.com/ocguilherme/4k-elgato.git"
         echo "         sudo bash sc0710/scripts/install-sc0710.sh"
         exit 1
     fi
@@ -139,7 +139,7 @@ is_steamos() {
 }
 
 # --- Configuration ---
-REPO_URL="https://raw.githubusercontent.com/ocguilherme/4k-elgato.git"
+REPO_URL="https://github.com/ocguilherme/4k-elgato.git"
 VERSION_URL="https://raw.githubusercontent.com/ocguilherme/4k-elgato/main/version"
 GIT_BRANCH="main"
 DRV_NAME="sc0710"
