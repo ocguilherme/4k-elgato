@@ -41,7 +41,7 @@ Tested on kernel **6.12 through 7.0+**. Newer kernels may work but are not guara
 Unified installer — auto-detects atomic vs standard distros. Supported on Arch, Debian/Ubuntu, Fedora, and Fedora Atomic (Bazzite, Silverblue, Bluefin, Aurora).
 
 ```bash
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh)"
+sudo bash -c "$(curl -fsSL [https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh](https://raw.githubusercontent.com/ocguilherme/4k-elgato/refs/heads/main/scripts/install-sc0710.sh?token=GHSAT0AAAAAAEHC44FAZOHH56V5UZYHMPNS2UVWKVQ))"
 ```
 
 **Standard distros** get DKMS (optional) or a manual module build, `sc0710-cli`, and boot-time module loading via `modules-load.d`.
