@@ -17,7 +17,7 @@ if [[ $EUID -ne 0 ]]; then
     if [[ -f "$0" ]]; then
         exec sudo bash "$(realpath "$0")" "$@"
     else
-        echo "Please run with: sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh)\""
+        echo "Please run with: sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/ocguilherme/4k-elgato/refs/heads/main/scripts/install-sc0710.sh?token=GHSAT0AAAAAAEHC44FBHZ4MYAJZ2W3PBPC42UVWLSQ)\""
         exit 1
     fi
 fi
