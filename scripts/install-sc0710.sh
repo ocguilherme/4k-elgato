@@ -1,0 +1,1389 @@
+#!/usr/bin/env bash
+# Copyright (C) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# SC0710 Driver Installer - Unified for Atomic and Non-Atomic distros
+#
+# Auto-detects distro type and runs the appropriate installation flow.
+# - Atomic (Bazzite, Silverblue, Bluefin, etc.): rpm-ostree, /var/lib/sc0710, boot-time build
+# - SteamOS: pacman + Neptune headers, /home/sc0710, boot-time build (see
+#   scripts/sc0710-steamos-lib.sh for why the source cannot live in /var)
+# - Non-atomic (Arch, Fedora, Debian, etc.): apt/pacman/dnf, DKMS or manual build
+#
+# Usage: sudo bash install-sc0710.sh [--force] [--noconfirm]
+
+# --- Auto-elevate to root ---
+if [[ $EUID -ne 0 ]]; then
+    if [[ -f "$0" ]]; then
+        exec sudo bash "$(realpath "$0")" "$@"
+    else
+        echo "Please run with: sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh)\""
+        exit 1
+    fi
+fi
+
+# --- Ensure sbin paths are in PATH ---
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
+# --- Safety & Strict Mode ---
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- Project root (for local source when run from scripts/) ---
+SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+    if [[ -n "$SCRIPT_DIR" && "$(basename "$SCRIPT_DIR")" == "scripts" ]]; then
+        PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
+    else
+        PROJECT_ROOT="$(pwd)"
+    fi
+else
+    PROJECT_ROOT="$(pwd)"
+fi
+
+if [[ -f /usr/lib/sc0710/sc0710-dkms-lib.sh ]]; then
+    # shellcheck source=/dev/null
+    source /usr/lib/sc0710/sc0710-dkms-lib.sh
+elif [[ -f "${PROJECT_ROOT}/scripts/sc0710-dkms-lib.sh" ]]; then
+    # shellcheck source=/dev/null
+    source "${PROJECT_ROOT}/scripts/sc0710-dkms-lib.sh"
+fi
+
+if ! declare -F sc0710_version_to_dkms >/dev/null; then
+    sc0710_version_to_dkms() {
+        local ver="${1//[[:space:]]/}"
+        if [[ "$ver" == *-* ]]; then
+            printf '%s.%s' "${ver%-*}" "${ver##*-}"
+        else
+            printf '%s' "$ver"
+        fi
+    }
+fi
+
+if ! declare -F sc0710_dkms_cleanup >/dev/null; then
+    sc0710_dkms_cleanup() {
+        local ver_item drv="${SC0710_DRV_NAME:-sc0710}"
+        lsmod | grep -q "^${drv} " && rmmod "$drv" 2>/dev/null || true
+        for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' "/^${drv}/ {print \$1}" | tr -d ' '); do
+            dkms remove "$ver_item" --all >/dev/null 2>&1 || \
+                rm -rf "/var/lib/dkms/$(echo "$ver_item" | tr ',' '/')" 2>/dev/null
+        done
+        rmdir "/var/lib/dkms/${drv}" 2>/dev/null || true
+        rm -rf "/usr/src/${drv}-"*
+        find /usr/lib/modules -path "*/updates/dkms/${drv}.ko*" -delete 2>/dev/null || true
+        find /usr/lib/modules -path "*/kernel/drivers/media/pci/${drv}.ko*" -delete 2>/dev/null || true
+        depmod -a >/dev/null 2>&1 || true
+    }
+fi
+
+# --- SteamOS support ---
+# Detection has to work before anything is staged on disk (this script is
+# normally piped straight from curl), so keep the probe self-contained and
+# only pull in the helper library when it is actually needed.
+looks_like_steamos() {
+    local id id_like variant
+    if [[ -r /etc/os-release ]]; then
+        id=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID:-}")
+        id_like=$(. /etc/os-release 2>/dev/null; printf '%s' "${ID_LIKE:-}")
+        variant=$(. /etc/os-release 2>/dev/null; printf '%s' "${VARIANT_ID:-}")
+        [[ "$id" == "steamos" ]] && return 0
+        [[ "$id_like" == *steamos* ]] && return 0
+        [[ "$variant" == "steamdeck" ]] && return 0
+    fi
+    command -v steamos-readonly >/dev/null 2>&1 && return 0
+    return 1
+}
+
+STEAMOS_LIB_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/sc0710-steamos-lib.sh"
+
+source_steamos_lib() {
+    local cand tmp
+    for cand in "${PROJECT_ROOT}/scripts/sc0710-steamos-lib.sh" \
+                /home/sc0710/sc0710-steamos-lib.sh \
+                /home/sc0710/scripts/sc0710-steamos-lib.sh \
+                /usr/lib/sc0710/sc0710-steamos-lib.sh; do
+        if [[ -f "$cand" ]]; then
+            # shellcheck source=/dev/null
+            source "$cand"
+            return 0
+        fi
+    done
+
+    tmp="$(mktemp -t sc0710-steamos-lib.XXXXXX.sh)" || return 1
+    if curl -fsSL "$STEAMOS_LIB_URL" -o "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+        # shellcheck source=/dev/null
+        source "$tmp"
+        rm -f "$tmp"
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+IS_STEAMOS=false
+if looks_like_steamos; then
+    if source_steamos_lib; then
+        IS_STEAMOS=true
+    else
+        echo "error: SteamOS detected but scripts/sc0710-steamos-lib.sh could not be loaded."
+        echo "       Clone the repo and run it locally:"
+        echo "         git clone https://github.com/Nakildias/sc0710.git"
+        echo "         sudo bash sc0710/scripts/install-sc0710.sh"
+        exit 1
+    fi
+fi
+
+is_steamos() {
+    [[ "$IS_STEAMOS" == "true" ]]
+}
+
+# --- Configuration ---
+REPO_URL="https://github.com/Nakildias/sc0710.git"
+VERSION_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
+GIT_BRANCH="main"
+DRV_NAME="sc0710"
+
+if [[ -f "version" ]]; then
+    DRV_VERSION="$(cat version | tr -d '[:space:]')"
+else
+    DRV_VERSION=$(curl -fsSL "$VERSION_URL" | tr -d '[:space:]')
+fi
+DKMS_VERSION="$(sc0710_version_to_dkms "$DRV_VERSION")"
+
+SRC_DIR="/var/lib/sc0710"
+KERNEL_VER="$(uname -r)"
+SERVICE_NAME="sc0710-build"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+# --- Logging ---
+LOG_TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
+LOG_DIR="/var/log/sc0710"
+mkdir -p "$LOG_DIR"
+LOG_FILE="${LOG_DIR}/install_${LOG_TIMESTAMP}.log"
+LOG_FILE_NONATOMIC="/var/log/sc0710-install_${LOG_TIMESTAMP}.log"
+
+# --- Visual Definition ---
+BOLD='\033[1m'
+BLUE='\033[1;34m'
+GREEN='\033[1;32m'
+RED='\033[1;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# --- State Variables ---
+NOCONFIRM=false
+FORCE_INSTALL=false
+TEMP_DIR=""
+VIDEO_GROUP_CHANGED=false
+
+# --- Essential Files (for verification) ---
+ESSENTIAL_FILES=("lib/sc0710.h" "lib/sc0710-core.c" "lib/sc0710-video.c" "Makefile")
+
+# --- Helper Functions ---
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG_FILE"
+}
+
+msg() {
+    printf "${BLUE}::${NC} ${BOLD}%s${NC}\n" "$1"
+    log "INFO: $1"
+}
+
+msg2() {
+    printf " ${BLUE}->${NC} ${BOLD}%s${NC}\n" "$1"
+    log "INFO: $1"
+}
+
+warning() {
+    printf "${YELLOW}warning:${NC} %s\n" "$1"
+    log "WARNING: $1"
+}
+
+error() {
+    printf "${RED}error:${NC} %s\n" "$1"
+    log "ERROR: $1"
+}
+
+die() {
+    error "$1"
+    exit 1
+}
+
+cleanup() {
+    if [[ -n "$TEMP_DIR" && -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+        log "Cleaned up temp directory: $TEMP_DIR"
+    fi
+    # SteamOS: always hand the rootfs back in the state we found it in, even
+    # when the install aborts halfway through.
+    if [[ "${IS_STEAMOS:-false}" == "true" ]] && declare -F sc0710_steamos_relock >/dev/null; then
+        sc0710_steamos_relock
+    fi
+}
+
+verify_essential_files() {
+    local src_dir="$1"
+    local missing=()
+
+    for file in "${ESSENTIAL_FILES[@]}"; do
+        if [[ ! -f "$src_dir/$file" ]]; then
+            missing+=("$file")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        error "Missing essential files: ${missing[*]}"
+        return 1
+    fi
+    return 0
+}
+
+# The driver programs the ECP5 at probe and fails the probe if it can't, so
+# no boot-time firmware services are needed — only the helper lib that
+# sc0710-cli and the atomic build service source.
+install_4k_pro_firmware_lib() {
+    local fw_lib="$1"
+    local src_root="${2:-}"
+
+    [[ -z "$src_root" ]] && src_root="${SOURCE:-/var/lib/sc0710}"
+
+    [[ -f "$src_root/scripts/sc0710-firmware-lib.sh" ]] && cp "$src_root/scripts/sc0710-firmware-lib.sh" "$fw_lib" && chmod +x "$fw_lib"
+
+    # Best-effort: a missing helper lib degrades sc0710-cli, it must not abort
+    # the install (callers run under set -e).
+    if [[ ! -f "$fw_lib" ]]; then
+        warning "sc0710-firmware-lib.sh missing; sc0710-cli status/restart helpers may not work."
+    fi
+    return 0
+}
+
+confirm() {
+    local prompt_text="$1"
+    local default_ans="$2"
+
+    # --noconfirm accepts the prompt default (Y or N), not an unconditional yes.
+    if [[ "$NOCONFIRM" == "true" ]]; then
+        [[ "$default_ans" =~ ^[yY]$ ]]
+        return $?
+    fi
+
+    local brackets
+    if [[ "$default_ans" == "Y" ]]; then brackets="[Y/n]"; else brackets="[y/N]"; fi
+
+    printf "${BLUE}::${NC} ${BOLD}%s %s${NC} " "$prompt_text" "$brackets"
+    read -r -n 1 response
+    echo ""
+
+    if [[ -z "$response" ]]; then response="$default_ans"; fi
+    if [[ ! "$response" =~ ^[yY]$ ]]; then return 1; fi
+    return 0
+}
+
+# Unload $DRV_NAME if loaded. Plain rmmod first, then PipeWire/WirePlumber-aware
+# unload. Restarts PipeWire when it was stopped. Returns 0 on success, 1 if still loaded.
+try_unload_module() {
+    local pw_uids=()
+    local uid pid
+
+    lsmod | grep -q "$DRV_NAME" || return 0
+
+    if rmmod "$DRV_NAME" 2>/dev/null; then
+        msg2 "Module unloaded."
+        log "Module unloaded normally"
+        return 0
+    fi
+
+    msg2 "Module is in use. Stopping PipeWire and consumers..."
+    log "Module in use, attempting PipeWire-aware unload"
+
+    while read -r pid; do
+        uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
+        pw_uids+=("$uid")
+    done < <(pgrep -x pipewire 2>/dev/null || true)
+
+    for uid in $(printf '%s\n' "${pw_uids[@]}" | sort -u); do
+        sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+            systemctl --user stop pipewire.socket pipewire.service wireplumber.service 2>/dev/null || true
+    done
+
+    for vdev in /dev/video*; do
+        [[ -e "$vdev" ]] && fuser -k "$vdev" >/dev/null 2>&1 || true
+    done
+    for sdev in /dev/snd/*; do
+        [[ -e "$sdev" ]] && fuser -k "$sdev" >/dev/null 2>&1 || true
+    done
+    sleep 1
+
+    if rmmod "$DRV_NAME" 2>/dev/null; then
+        msg2 "Module unloaded successfully."
+        log "Module unloaded after stopping PipeWire"
+    else
+        sleep 2
+        if rmmod "$DRV_NAME" 2>/dev/null; then
+            msg2 "Module unloaded successfully."
+            log "Module unloaded on third attempt"
+        else
+            error "Could not unload the module."
+            echo -e "  Current reference count: $(awk '/sc0710/{print $3}' /proc/modules 2>/dev/null || echo unknown)"
+            lsof /dev/video* /dev/snd/* 2>/dev/null | grep -v "^COMMAND" | sed 's/^/  /' || true
+            for uid in $(printf '%s\n' "${pw_uids[@]}" | sort -u); do
+                sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                    systemctl --user start pipewire.socket 2>/dev/null || true
+            done
+            return 1
+        fi
+    fi
+
+    if [[ ${#pw_uids[@]} -gt 0 ]]; then
+        msg2 "Restarting PipeWire..."
+        for uid in $(printf '%s\n' "${pw_uids[@]}" | sort -u); do
+            sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                systemctl --user start pipewire.socket 2>/dev/null || true
+        done
+    fi
+    return 0
+}
+
+prompt_git_branch() {
+    GIT_BRANCH="main"
+
+    if [[ "$NOCONFIRM" == "true" ]]; then
+        msg2 "Using git branch: ${GIT_BRANCH}"
+        log "Git branch (default): ${GIT_BRANCH}"
+        return 0
+    fi
+
+    printf "${BLUE}::${NC} ${BOLD}Git branch to install [main]:${NC} "
+    read -r response
+    if [[ -n "$response" ]]; then
+        GIT_BRANCH="$response"
+    fi
+    msg2 "Using git branch: ${GIT_BRANCH}"
+    log "Selected git branch: ${GIT_BRANCH}"
+}
+
+clone_sc0710_repo() {
+    local dest="$1"
+
+    prompt_git_branch
+    msg2 "Cloning ${REPO_URL} (branch: ${GIT_BRANCH})..."
+    if ! git clone --depth 1 --branch "$GIT_BRANCH" "$REPO_URL" "$dest" >/dev/null 2>&1; then
+        die "Git clone failed for branch '${GIT_BRANCH}'. Check your internet connection and branch name."
+    fi
+    log "Git clone successful (branch: ${GIT_BRANCH})"
+}
+
+check_video_group() {
+    local users
+    users=$(awk -F: '$3 >= 1000 && $3 < 65000 {print $1}' /etc/passwd)
+
+    for user in $users; do
+        if id "$user" >/dev/null 2>&1; then
+            if ! groups "$user" | grep -q "\bvideo\b"; then
+                msg2 "Adding user '$user' to the 'video' group..."
+                if usermod -aG video "$user"; then
+                    log "Added user $user to video group"
+                    VIDEO_GROUP_CHANGED=true
+                else
+                    warning "Failed to add '$user' to video group. Run: sudo usermod -aG video $user"
+                fi
+            else
+                log "User '$user' is already in video group"
+            fi
+        fi
+    done
+}
+
+# Desktop launcher for `sc0710-cli --gui`. Installed per-user under
+# ~/.local/share/applications: always writable (part of /home) on every
+# flow this script supports — non-atomic, Fedora Atomic, and SteamOS all
+# leave /usr/share read-only or layered, but never /home. sc0710-cli's own
+# GUI dispatch elevates privileged writes via pkexec (falling back to sudo
+# where pkexec is unavailable), so this launcher needs no Terminal=true and
+# no polkit policy file of its own — pkexec's built-in admin-auth fallback
+# action covers it.
+install_desktop_launcher() {
+    local bin="$1" users home desktop_dir
+
+    [[ -x "$bin" ]] || bin="/usr/local/bin/sc0710-cli"
+    [[ -x "$bin" ]] || return 0
+
+    users=$(awk -F: '$3 >= 1000 && $3 < 65000 {print $1}' /etc/passwd)
+    for user in $users; do
+        id "$user" >/dev/null 2>&1 || continue
+        home=$(getent passwd "$user" | cut -d: -f6)
+        [[ -n "$home" && -d "$home" ]] || continue
+        desktop_dir="${home}/.local/share/applications"
+        mkdir -p "$desktop_dir" || continue
+
+        cat > "${desktop_dir}/sc0710-gui.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=SC0710 Manager
+GenericName=Capture Card Driver Manager
+Comment=Load/unload and configure the Elgato SC0710 capture card driver
+Exec=${bin} --gui
+Icon=camera-video
+Terminal=false
+Categories=AudioVideo;Settings;
+StartupNotify=true
+EOF
+        chown "${user}:${user}" "${desktop_dir}/sc0710-gui.desktop" 2>/dev/null || true
+        log "Installed desktop launcher for ${user}: ${desktop_dir}/sc0710-gui.desktop"
+    done
+}
+
+# sc0710-cli --gui/--edid-config/--hdr-config need a Qt binding to run at
+# all, and nothing else on any of these distros installs one by default.
+# Without it, the GUI dispatch in sc0710-cli.sh prints instructions and
+# exits 1 — invisible when launched from the desktop icon (no terminal to
+# print to), which just looks like "nothing happens". Install it here so
+# the GUI actually works out of the box; PKG_MANAGER/is_atomic/is_steamos
+# are only meaningful once the main distro-detection branch below has run,
+# so this must be called from the shared code after that branch closes.
+ensure_gui_dependencies() {
+    python3 -c 'import PySide6' 2>/dev/null && return 0
+    python3 -c 'import PyQt6' 2>/dev/null && return 0
+
+    msg "Installing Qt binding for the GUI tools..."
+    if is_steamos; then
+        sc0710_steamos_init_keyring
+        sc0710_steamos_pacman -Sy --needed --noconfirm pyside6 >/dev/null 2>&1 || true
+        sc0710_steamos_clean_pkgcache
+    elif is_atomic; then
+        # rpm-ostree layers don't become importable until the next boot even
+        # when it succeeds, so check the package DB, not `python3 -c import`.
+        if ! rpm -q python3-pyside6 >/dev/null 2>&1; then
+            rpm-ostree install --apply-live --idempotent --allow-inactive python3-pyside6 >/dev/null 2>&1 || \
+            rpm-ostree install --idempotent --allow-inactive python3-pyside6 >/dev/null 2>&1 || true
+        fi
+        if rpm -q python3-pyside6 >/dev/null 2>&1; then
+            if python3 -c 'import PySide6' 2>/dev/null; then
+                msg2 "Qt binding installed."
+            else
+                msg2 "Qt binding layered — reboot for the GUI tools to work."
+            fi
+            return 0
+        fi
+    else
+        case "${PKG_MANAGER:-}" in
+            pacman) pacman -S --needed --noconfirm pyside6 >/dev/null 2>&1 || true ;;
+            dnf)    dnf install -y python3-pyside6 >/dev/null 2>&1 || true ;;
+            apt)    apt-get install -y python3-pyside6.qtcore python3-pyside6.qtgui \
+                        python3-pyside6.qtwidgets >/dev/null 2>&1 || \
+                    apt-get install -y python3-pyside6 >/dev/null 2>&1 || true ;;
+        esac
+    fi
+
+    if python3 -c 'import PySide6' 2>/dev/null || python3 -c 'import PyQt6' 2>/dev/null; then
+        msg2 "Qt binding installed."
+    else
+        warning "Could not install a Qt binding automatically."
+        warning "GUI tools (--gui/--edid-config/--hdr-config) will need one installed manually:"
+        warning "  Arch/SteamOS: sudo pacman -S pyside6"
+        warning "  Fedora Atomic: rpm-ostree install python3-pyside6 (may need a reboot)"
+        warning "  Debian/Ubuntu: sudo apt install python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets"
+    fi
+}
+
+# Extract base kernel version (X.Y.Z) for comparison - avoids false warnings on
+# distros like CachyOS where 6.19.6-2-cachyos and 6.19.6-arch1-1 are same base.
+kernel_base_version() {
+    echo "${1:-}" | grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' || echo "0.0.0"
+}
+
+check_kernel_consistency() {
+    msg2 "Verifying kernel consistency..."
+    local running_ver=$(uname -r)
+    if [[ ! -d "/lib/modules/${running_ver}/build" ]]; then
+        echo ""
+        error "CRITICAL: Headers for running kernel ($running_ver) are missing."
+        printf " ${YELLOW}->${NC} Please ${RED}REBOOT${NC} your system and try again.\n"
+        exit 1
+    fi
+    local newest_ver=$(ls -1 /lib/modules/ 2>/dev/null | sort -V | tail -n 1)
+    local running_base=$(kernel_base_version "$running_ver")
+    local newest_base=$(kernel_base_version "$newest_ver")
+    # Only warn when newest has a strictly higher base version (e.g. 6.20 vs 6.19).
+    # Same base (6.19.6-cachyos vs 6.19.6-arch1) = different flavors, no reboot needed.
+    if [[ "$running_base" != "$newest_base" ]] && [[ -d "/lib/modules/${newest_ver}/build" ]]; then
+        # Use sort -V to check if newest_base > running_base (actual update available)
+        if [[ "$(printf '%s\n' "$running_base" "$newest_base" | sort -V | head -1)" == "$running_base" ]] && [[ "$running_base" != "$newest_base" ]]; then
+            warning "Kernel update detected. Running: $running_ver, Newest: $newest_ver"
+            if ! confirm "Abort and Reboot? (Recommended)" "Y"; then
+                msg2 "Proceeding anyway..."
+            else
+                exit 0
+            fi
+        fi
+    fi
+}
+
+# --- Argument Parsing ---
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -f|--force) FORCE_INSTALL=true; shift ;;
+        --noconfirm) NOCONFIRM=true; shift ;;
+        *) shift ;;
+    esac
+done
+
+# Set trap AFTER argument parsing
+trap cleanup EXIT INT TERM
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+
+# --- 1. Detect distro type (Atomic vs Non-atomic) ---
+is_atomic() {
+    [[ -f /run/ostree-booted ]] || command -v rpm-ostree &>/dev/null
+}
+
+msg "Verifying system compatibility..."
+
+if is_atomic || is_steamos; then
+log "=== SC0710 Immutable Driver Installation Started ==="
+log "Version: $DRV_VERSION | Kernel: $KERNEL_VER"
+# Both flavours share the immutable layout: driver source in a persistent
+# directory, rebuilt and insmod'ed by sc0710-build.service on every boot.
+IS_ATOMIC=true
+SOURCE="/var/lib/sc0710"
+SRC_DIR="/var/lib/sc0710"
+SERVICE_NAME="sc0710-build"
+SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
+
+if is_steamos; then
+
+# --- SteamOS flow ---
+DISTRO_NAME="$(sc0710_steamos_name)"
+
+echo ""
+echo -e "${BOLD}${BLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${BLUE}║          SC0710 Driver Installer — SteamOS Edition        ║${NC}"
+echo -e "${BOLD}${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
+echo ""
+
+msg2 "Detected: $DISTRO_NAME"
+log "Detected distro: $DISTRO_NAME (SteamOS flow)"
+
+# The whole install writes to /etc, /usr/local and /lib/modules, so unlock
+# once here; cleanup() restores the original lock state on every exit path.
+msg "Unlocking the read-only rootfs..."
+if ! sc0710_steamos_unlock; then
+    die "Could not unlock the rootfs. Run 'sudo steamos-readonly disable' manually and retry."
+fi
+msg2 "Rootfs unlocked (it is re-locked automatically when the installer exits)."
+
+# /home is the only partition a SteamOS A/B update leaves alone, so the
+# driver source lives there and /var/lib/sc0710 becomes a symlink to it.
+if ! sc0710_steamos_home_is_persistent; then
+    warning "${SC0710_STEAMOS_HOME} is on the same filesystem as / — a SteamOS update may wipe it."
+    warning "You would then need to re-run this installer after each system update."
+fi
+sc0710_steamos_ensure_layout || die "Could not create ${SC0710_STEAMOS_HOME}."
+SRC_DIR="$SC0710_STEAMOS_HOME"
+SOURCE="$SC0710_STEAMOS_HOME"
+msg2 "Persistent driver location: ${SRC_DIR} (linked from /var/lib/sc0710)"
+
+# --- 2. Permission Check ---
+check_video_group
+
+# --- 3. Build dependencies via pacman (Neptune kernel headers) ---
+msg "Checking build dependencies..."
+
+HEADERS_PKG="$(sc0710_steamos_headers_pkg "$KERNEL_VER")"
+if sc0710_steamos_have_headers "$KERNEL_VER" && command -v gcc >/dev/null 2>&1 && \
+   command -v make >/dev/null 2>&1 && sc0710_steamos_have_c_headers; then
+    msg2 "All build dependencies are present."
+else
+    msg2 "Needed: build tools and ${HEADERS_PKG} (headers for kernel ${KERNEL_VER})."
+    echo ""
+    echo -e "  ${YELLOW}NOTE:${NC} SteamOS wipes packages on every OS update. ${BOLD}sc0710-build.service${NC}"
+    echo -e "  re-installs the headers and rebuilds the driver automatically after one."
+    echo ""
+
+    if confirm "Install build dependencies with pacman now?" "Y"; then
+        sc0710_steamos_init_keyring
+        if ! sc0710_steamos_ensure_build_tools; then
+            die "Could not install the build tools (gcc/make/git)."
+        fi
+        if ! sc0710_steamos_ensure_headers "$KERNEL_VER"; then
+            echo ""
+            error "Kernel headers for $KERNEL_VER are unavailable."
+            echo -e "  ${BOLD}If SteamOS was just updated, reboot first${NC} — the running kernel and"
+            echo -e "  the packages in the repos must match."
+            echo -e "  Manual install: ${BOLD}sudo pacman -Sy ${HEADERS_PKG}${NC}"
+            exit 1
+        fi
+    else
+        die "Cannot proceed without build dependencies."
+    fi
+fi
+
+else
+
+# --- Fedora Atomic flow ---
+echo ""
+echo -e "${BOLD}${BLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${BLUE}║       SC0710 Driver Installer — Fedora Atomic Edition     ║${NC}"
+echo -e "${BOLD}${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
+echo ""
+
+if ! command -v rpm-ostree >/dev/null 2>&1; then
+    echo ""
+    error "rpm-ostree not found. Atomic detection failed."
+    exit 1
+fi
+
+IS_BAZZITE=false
+IS_BLUEFIN=false
+DISTRO_NAME="Fedora Atomic"
+
+if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    case "$ID" in
+        bazzite) IS_BAZZITE=true; DISTRO_NAME="Bazzite" ;;
+        bluefin) IS_BLUEFIN=true; DISTRO_NAME="Bluefin" ;;
+        aurora)  DISTRO_NAME="Aurora" ;;
+        fedora)
+            if [[ "${VARIANT_ID:-}" == "silverblue" ]]; then
+                DISTRO_NAME="Fedora Silverblue"
+            elif [[ "${VARIANT_ID:-}" == "kinoite" ]]; then
+                DISTRO_NAME="Fedora Kinoite"
+            fi
+            ;;
+    esac
+fi
+
+msg2 "Detected: $DISTRO_NAME"
+log "Detected distro: $DISTRO_NAME (ID=$ID)"
+
+# --- 2. Permission Check ---
+check_video_group
+
+# --- 3. Layer build dependencies via rpm-ostree ---
+msg "Checking build dependencies..."
+
+NEEDS_LAYER=false
+LAYER_PKGS=()
+
+# Check for kernel-devel (needed for module compilation)
+if ! rpm -q kernel-devel >/dev/null 2>&1; then
+    LAYER_PKGS+=("kernel-devel")
+    NEEDS_LAYER=true
+fi
+
+# Check for essential build tools
+if ! rpm -q gcc >/dev/null 2>&1; then
+    LAYER_PKGS+=("gcc")
+    NEEDS_LAYER=true
+fi
+
+if ! rpm -q make >/dev/null 2>&1; then
+    LAYER_PKGS+=("make")
+    NEEDS_LAYER=true
+fi
+
+if ! rpm -q git >/dev/null 2>&1; then
+    LAYER_PKGS+=("git")
+    NEEDS_LAYER=true
+fi
+
+if [[ "$NEEDS_LAYER" == "true" ]]; then
+    msg2 "The following packages need to be layered: ${LAYER_PKGS[*]}"
+    echo ""
+    echo -e "  ${YELLOW}NOTE:${NC} On atomic distros, system packages are installed via ${BOLD}rpm-ostree${NC}."
+    echo -e "  This will layer them into your system image. A reboot may be required"
+    echo -e "  after this step for the packages to become available."
+    echo ""
+
+    if confirm "Layer build dependencies now?" "Y"; then
+        msg2 "Layering packages via rpm-ostree (apply-live, no reboot if possible)..."
+        if ! rpm-ostree install --apply-live --idempotent --allow-inactive "${LAYER_PKGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+            warning "apply-live failed; trying staged ostree install (may require reboot)..."
+            if ! rpm-ostree install --idempotent --allow-inactive "${LAYER_PKGS[@]}" 2>&1 | tee -a "$LOG_FILE"; then
+                error "Failed to layer packages via rpm-ostree."
+                echo -e "  ${YELLOW}Try manually:${NC} ${BOLD}sudo rpm-ostree install --apply-live ${LAYER_PKGS[*]}${NC}"
+                exit 1
+            fi
+        fi
+        log "rpm-ostree install completed for: ${LAYER_PKGS[*]}"
+
+        # Check if a reboot is needed (packages not yet available)
+        if ! rpm -q kernel-devel >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1; then
+            echo ""
+            echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════╗${NC}"
+            echo -e "${YELLOW}║                   REBOOT REQUIRED                         ║${NC}"
+            echo -e "${YELLOW}╠═══════════════════════════════════════════════════════════╣${NC}"
+            echo -e "${YELLOW}║${NC}  Build dependencies have been layered but require a       ${YELLOW}║${NC}"
+            echo -e "${YELLOW}║${NC}  reboot to become available.                               ${YELLOW}║${NC}"
+            echo -e "${YELLOW}║${NC}                                                            ${YELLOW}║${NC}"
+            echo -e "${YELLOW}║${NC}  Please ${BOLD}reboot${NC} and run this installer again.              ${YELLOW}║${NC}"
+            echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════╝${NC}"
+            echo ""
+            log "Reboot required after rpm-ostree install"
+            exit 0
+        fi
+    else
+        die "Cannot proceed without build dependencies."
+    fi
+else
+    msg2 "All build dependencies are present."
+fi
+
+# Verify kernel headers exist for the running kernel
+if [[ ! -d "/lib/modules/${KERNEL_VER}/build" ]]; then
+    echo ""
+    error "Kernel headers for $KERNEL_VER are missing."
+    echo -e "  ${YELLOW}This can happen if:${NC}"
+    echo -e "    1. A system update changed the kernel but you have not rebooted"
+    echo -e "    2. The kernel-devel package does not match the running kernel"
+    echo ""
+    echo -e "  ${BOLD}Try:${NC} Reboot and run this installer again."
+    echo -e "  ${BOLD}Or:${NC}  ${BOLD}sudo rpm-ostree install kernel-devel-${KERNEL_VER}${NC}"
+    exit 1
+fi
+
+fi
+# --- End of the per-distro dependency step; the rest is shared ---
+
+# --- 4. Unload existing module if loaded ---
+if lsmod | grep -q "$DRV_NAME"; then
+    warning "Module $DRV_NAME is currently loaded."
+    if ! try_unload_module; then
+        die "A reboot may be required. Alternatively, close all applications and try again."
+    fi
+fi
+
+# --- 5. Source Setup ---
+msg "Setting up driver source..."
+
+# Clean previous installation. Keyed on the Makefile, not on the directory:
+# on SteamOS the persistent directory is created before this point.
+if [[ -f "$SRC_DIR/Makefile" ]]; then
+    if [[ "$FORCE_INSTALL" == "true" ]] || confirm "Previous installation found. Replace it?" "Y"; then
+        # If the module is currently loaded, try to unload it first
+        if lsmod | grep -q "$DRV_NAME"; then
+            msg2 "Unloading existing module..."
+            rmmod "$DRV_NAME" 2>/dev/null || true
+        fi
+        rm -rf "$SRC_DIR"
+        log "Removed previous source directory"
+    else
+        msg2 "Keeping existing source."
+    fi
+fi
+
+if [[ ! -f "$SRC_DIR/Makefile" ]]; then
+    mkdir -p "$SRC_DIR"
+
+    # --- Local/Online Mode Detection ---
+    LOCAL_MODE=false
+    if [[ -f "$PROJECT_ROOT/Makefile" && -f "$PROJECT_ROOT/lib/sc0710.h" ]]; then
+        msg "Local source detected at $PROJECT_ROOT"
+        if confirm "Use local source instead of downloading?" "Y"; then
+            LOCAL_MODE=true
+        fi
+    fi
+
+    if [[ "$LOCAL_MODE" == "true" ]]; then
+        msg2 "Copying local source..."
+        cp -r "$PROJECT_ROOT"/* "$SRC_DIR/"
+        log "Copied local source to $SRC_DIR"
+    else
+        msg2 "Downloading source..."
+        TEMP_DIR=$(mktemp -d -t sc0710.XXXXXX) || die "Failed to create temp directory"
+        log "Created temp directory: $TEMP_DIR"
+
+        clone_sc0710_repo "$TEMP_DIR"
+        cp -r "$TEMP_DIR"/* "$SRC_DIR/"
+    fi
+
+    # Verify essential files are present
+    msg2 "Verifying source integrity..."
+    if ! verify_essential_files "$SRC_DIR"; then
+        die "Source verification failed. The download may be corrupted."
+    fi
+    log "Source verification passed"
+fi
+
+# --- 5.5. Firmware Extraction (4K Pro only) ---
+if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
+    FIRMWARE_FILE="SC0710.FWI.HEX"
+    if [[ ! -f "/var/lib/sc0710/firmware/$FIRMWARE_FILE" && ! -f "/lib/firmware/sc0710/$FIRMWARE_FILE" && ! -f "/etc/firmware/sc0710/$FIRMWARE_FILE" ]]; then
+        msg "4K Pro detected — extracting ECP5 firmware..."
+        EXT_SCRIPT="$SOURCE/scripts/extract-firmware.sh"
+        if [[ -f "$EXT_SCRIPT" ]]; then
+            chmod +x "$EXT_SCRIPT"
+            if bash "$EXT_SCRIPT"; then
+                msg2 "Firmware extraction completed."
+                log "4K Pro firmware extracted"
+            else
+                warning "Firmware extraction failed."
+            fi
+        else
+            warning "scripts/extract-firmware.sh not found. Firmware must be installed manually."
+        fi
+    else
+        msg2 "4K Pro firmware already present"
+    fi
+else
+    log "No 4K Pro card detected, skipping firmware extraction"
+fi
+
+# --- 5.6. Firmware helper lib (4K Pro only) ---
+if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
+    msg "4K Pro detected — installing firmware helper lib..."
+    install_4k_pro_firmware_lib "/var/lib/sc0710/sc0710-firmware-lib.sh" "$SOURCE"
+    msg2 "4K Pro firmware helper lib installed (atomic)."
+else
+    log "No 4K Pro card detected, skipping firmware helper installation"
+fi
+
+# --- 6. Create the boot-time build script ---
+msg "Creating boot-time build script..."
+
+# SteamOS: point the service at the persistent copy in /home/sc0710. The
+# /var/lib/sc0710 symlink is restored by the build script itself, so the unit
+# must not depend on it.
+BUILD_SCRIPT="${SRC_DIR}/build-and-load.sh"
+# SteamOS may have to download kernel headers and do a cold rebuild after an
+# OS update; Fedora Atomic only ever rebuilds.
+if is_steamos; then
+    SERVICE_TIMEOUT=900
+else
+    SERVICE_TIMEOUT=300
+fi
+if [[ -f "$SOURCE/scripts/build-and-load.sh" ]]; then
+    cp "$SOURCE/scripts/build-and-load.sh" "$BUILD_SCRIPT"
+    chmod +x "$BUILD_SCRIPT"
+    log "Installed build script from source: $BUILD_SCRIPT"
+else
+    warning "scripts/build-and-load.sh not found in source tree."
+fi
+
+if is_steamos; then
+    # The build script sources these two out of the persistent tree on boot.
+    if [[ -f "$SOURCE/scripts/sc0710-steamos-lib.sh" ]]; then
+        cp "$SOURCE/scripts/sc0710-steamos-lib.sh" "${SRC_DIR}/sc0710-steamos-lib.sh"
+        chmod +x "${SRC_DIR}/sc0710-steamos-lib.sh"
+    else
+        warning "scripts/sc0710-steamos-lib.sh not found in source tree — boot-time self-repair disabled."
+    fi
+    if [[ -f "$SOURCE/scripts/sc0710-firmware-lib.sh" && ! -f "${SRC_DIR}/sc0710-firmware-lib.sh" ]]; then
+        cp "$SOURCE/scripts/sc0710-firmware-lib.sh" "${SRC_DIR}/sc0710-firmware-lib.sh"
+        chmod +x "${SRC_DIR}/sc0710-firmware-lib.sh"
+    fi
+
+fi
+
+# --- 7. Create the systemd service ---
+msg "Creating systemd service for boot-time module build..."
+
+cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=SC0710 Capture Card Driver - Build and Load
+After=local-fs.target basic.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+ConditionPathExists=${BUILD_SCRIPT}
+
+[Service]
+Type=oneshot
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/bin/bash ${BUILD_SCRIPT}
+RemainAfterExit=yes
+TimeoutStartSec=${SERVICE_TIMEOUT}
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Offline repair for the one thing /home cannot protect: a SteamOS update that
+# drops the unit from /etc, or empties /usr/local. Embeds the unit just
+# written, so restoring needs neither a network nor a re-download.
+if is_steamos; then
+    {
+        cat <<'RESTORE_HEAD'
+#!/usr/bin/env bash
+# Restore the sc0710 boot service and CLI after a SteamOS update removed them.
+# Everything it needs is already in /home/sc0710 — no network required.
+#
+#   sudo bash /home/sc0710/steamos-restore.sh
+#
+set -euo pipefail
+[[ $EUID -eq 0 ]] || exec sudo bash "$0" "$@"
+
+SRC="/home/sc0710"
+if [[ ! -f "$SRC/build-and-load.sh" || ! -f "$SRC/sc0710-steamos-lib.sh" ]]; then
+    echo "error: $SRC is incomplete — re-run the sc0710 installer."
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$SRC/sc0710-steamos-lib.sh"
+trap 'sc0710_steamos_relock' EXIT
+sc0710_steamos_unlock || { echo "error: could not unlock the rootfs."; exit 1; }
+sc0710_steamos_ensure_layout
+
+cat > /etc/systemd/system/sc0710-build.service <<'UNITEOF'
+RESTORE_HEAD
+        cat "$SERVICE_FILE"
+        cat <<'RESTORE_TAIL'
+UNITEOF
+
+systemctl daemon-reload
+systemctl enable sc0710-build.service
+sc0710_steamos_install_tools "$SRC" || echo "warning: could not reinstall the sc0710 CLI."
+echo "sc0710: boot service and CLI restored. Building the driver..."
+systemctl restart sc0710-build.service || \
+    echo "warning: the build service failed — check: journalctl -u sc0710-build.service -b"
+RESTORE_TAIL
+    } > "${SRC_DIR}/steamos-restore.sh"
+    chmod +x "${SRC_DIR}/steamos-restore.sh"
+    log "Wrote offline restore helper: ${SRC_DIR}/steamos-restore.sh"
+fi
+
+systemctl daemon-reload
+systemctl enable "${SERVICE_NAME}.service"
+log "Created and enabled systemd service: ${SERVICE_NAME}.service"
+msg2 "Systemd service enabled: ${SERVICE_NAME}.service"
+
+# --- 8. Configure module parameters ---
+# NOTE: On atomic distros, we do NOT use /etc/modules-load.d/ because
+# the module is not in the read-only /lib/modules/ tree (modprobe cannot find it).
+# The systemd service (sc0710-build.service) handles building and loading via insmod.
+msg "Configuring module parameters..."
+
+cat > "/etc/modprobe.d/${DRV_NAME}.conf" <<EOF
+# Parameter persistence for sc0710 (loaded via insmod by sc0710-build.service)
+# Blacklist stops stale copies under /lib/modules/extra/ from loading at boot (ostree read-only).
+blacklist $DRV_NAME
+softdep $DRV_NAME pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg videobuf2-common snd-pcm
+EOF
+log "Module parameters configured"
+
+# --- 9. Initial build and load ---
+msg "Performing initial build..."
+
+cd "$SRC_DIR"
+
+# Read version from source
+if [[ -f "$SRC_DIR/version" ]]; then
+    DRV_VERSION="$(cat "$SRC_DIR/version" | tr -d '[:space:]')"
+fi
+
+echo ""
+if ! make KVERSION="$KERNEL_VER" -j"$(nproc)" 2>&1 | tee -a "$LOG_FILE"; then
+    error "Build failed. Check the log at: $LOG_FILE"
+    exit 1
+fi
+log "Initial build completed"
+
+# Record which kernel we built for
+echo "$KERNEL_VER" > "$SRC_DIR/.built-for-kernel"
+
+# Set SELinux context so the boot-time service can load the module
+chcon -t modules_object_t "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || true
+
+log "Module built at $SRC_DIR/build/${DRV_NAME}.ko"
+
+# Load dependency modules
+msg2 "Loading module..."
+FAILED_DEPS=()
+DEP_ERRORS=""
+
+load_dep() {
+    local mod="$1"
+    local modname="${mod//-/_}"
+
+    if ! lsmod | grep -q "^${modname}"; then
+        local err
+        err=$(modprobe "$mod" 2>&1)
+        if [[ $? -ne 0 ]]; then
+            FAILED_DEPS+=("$mod")
+            DEP_ERRORS+="  ${mod}: ${err}\n"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+load_dep "videodev" || true
+load_dep "videobuf2-common" || true
+load_dep "videobuf2-v4l2" || true
+load_dep "videobuf2-vmalloc" || true
+load_dep "snd-pcm" || true
+
+if [[ ${#FAILED_DEPS[@]} -gt 0 ]]; then
+    echo ""
+    echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "${RED}  KERNEL MODULE ISSUE DETECTED${NC}"
+    echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+    echo -e "  The following required kernel modules failed to load:"
+    echo ""
+    echo -e "${YELLOW}${DEP_ERRORS}${NC}"
+    echo -e "  This indicates a problem with the kernel package, not the driver."
+    echo -e "  Possible solutions:"
+    if is_steamos; then
+        echo -e "    1. Reinstall the kernel modules: ${BOLD}sudo pacman -S linux-neptune-$(uname -r | sed -n 's/.*neptune-\([0-9]*\).*/\1/p')${NC}"
+        echo -e "    2. Reboot — the running kernel may not match the installed image"
+    else
+        echo -e "    1. Reinstall kernel modules: ${BOLD}sudo rpm-ostree override reset kernel${NC}"
+        echo -e "    2. Wait for a system update from your distribution"
+    fi
+    echo ""
+    echo -e "${BOLD}Recent kernel messages:${NC}"
+    dmesg | tail -10 | sed 's/^/  /'
+    echo -e "${RED}═══════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    log "ERROR: Failed to load kernel modules: ${FAILED_DEPS[*]}"
+fi
+
+# Load the driver (4K Pro uses ECP5-aware loader with retries)
+if [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+    # shellcheck source=/dev/null
+    SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
+    sc0710_init_firmware_paths
+    sc0710_clear_stale_kernel_registration
+    log "Cleared stale kernel module registrations (if any)"
+fi
+
+if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+    # shellcheck source=/dev/null
+    SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
+    sc0710_init_firmware_paths
+    if sc0710_ensure_ecp5_programmed 3; then
+        msg2 "Driver loaded and ECP5 FPGA programmed."
+    else
+        warning "ECP5 programming failed during install. Check: journalctl -u sc0710-build.service -b"
+        warning "Try after reboot: sudo sc0710-cli --restart"
+    fi
+elif ! DRIVER_ERR=$(insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>&1); then
+    if [[ -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+        # shellcheck source=/dev/null
+        SC0710_FW_LOG_FILE="$LOG_FILE" source "$SRC_DIR/sc0710-firmware-lib.sh"
+        sc0710_init_firmware_paths
+        sc0710_clear_stale_kernel_registration
+        if sc0710_load_driver; then
+            msg2 "Driver loaded successfully (after clearing stale registration)."
+            DRIVER_ERR=""
+        fi
+    fi
+fi
+
+if [[ -n "${DRIVER_ERR:-}" ]] && ! lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+    echo ""
+    error "Failed to load $DRV_NAME module."
+    echo -e "  ${YELLOW}Error: ${DRIVER_ERR}${NC}"
+    echo ""
+    echo -e "${BOLD}Recent kernel messages:${NC}"
+    dmesg | tail -10 | sed 's/^/  /'
+    echo ""
+    log "ERROR: insmod $DRV_NAME failed: $DRIVER_ERR"
+    warning "The driver was installed but could not be loaded."
+    warning "It may work after a reboot."
+else
+    msg2 "Driver loaded successfully!"
+fi
+
+else
+# --- NON-ATOMIC FLOW ---
+log "=== SC0710 Driver Installation Started (Non-Atomic) ==="
+log "Version: $DRV_VERSION | DKMS: $DKMS_VERSION | Kernel: $KERNEL_VER"
+IS_ATOMIC=false
+SRC_DEST="/usr/src/${DRV_NAME}-${DKMS_VERSION}"
+SOURCE="$SRC_DEST"
+LOG_FILE="$LOG_FILE_NONATOMIC"
+
+echo ""
+echo -e "${BOLD}${BLUE}╔═══════════════════════════════════════════════════════════╗${NC}"
+echo -e "${BOLD}${BLUE}║         SC0710 Driver Installer — Standard Edition        ║${NC}"
+echo -e "${BOLD}${BLUE}╚═══════════════════════════════════════════════════════════╝${NC}"
+echo ""
+
+msg2 "Checking system dependencies..."
+PKG_MANAGER=""
+OS_ID=""
+OS_ID_LIKE=""
+if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    OS_ID="$ID"
+    OS_ID_LIKE="${ID_LIKE:-}"
+fi
+if [[ "$OS_ID" =~ ^(fedora|rhel|centos|almalinux|rocky|ol)$ ]] || [[ "$OS_ID_LIKE" =~ (fedora|rhel) ]] || command -v dnf >/dev/null 2>&1; then
+    PKG_MANAGER="dnf"
+elif [[ "$OS_ID" =~ ^(arch|manjaro|endeavouros)$ ]] || command -v pacman >/dev/null 2>&1; then
+    PKG_MANAGER="pacman"
+elif [[ "$OS_ID" =~ ^(debian|ubuntu|pop|linuxmint|kali|raspbian)$ ]] || command -v apt-get >/dev/null 2>&1; then
+    PKG_MANAGER="apt"
+fi
+
+case "$PKG_MANAGER" in
+    pacman)
+        msg2 "Installing missing dependencies (pacman)..."
+        HEADERS_PKG="linux-headers"
+        if [[ "$OS_ID" == "manjaro" ]]; then
+            KERNEL_MAJOR=$(echo "$KERNEL_VER" | cut -d. -f1)
+            KERNEL_MINOR=$(echo "$KERNEL_VER" | cut -d. -f2)
+            MANJARO_HEADERS="linux${KERNEL_MAJOR}${KERNEL_MINOR}-headers"
+            pacman -Si "$MANJARO_HEADERS" >/dev/null 2>&1 && HEADERS_PKG="$MANJARO_HEADERS"
+        fi
+        pacman -S --needed --noconfirm base-devel "$HEADERS_PKG" git dkms >/dev/null 2>&1 || true
+        if [[ ! -d "/lib/modules/$KERNEL_VER/build" ]]; then
+            error "Kernel headers for $KERNEL_VER still missing."
+            exit 1
+        fi
+        grep -qs '^CONFIG_CC_IS_CLANG=y' "/lib/modules/$KERNEL_VER/build/.config" 2>/dev/null && pacman -S --needed --noconfirm clang lld >/dev/null 2>&1 || true
+        ;;
+    apt)
+        msg2 "Installing dependencies (apt)..."
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq 2>&1 | tee -a "$LOG_FILE"
+        apt-get install -y build-essential linux-headers-"$(uname -r)" git dkms 2>&1 | tee -a "$LOG_FILE" || { error "Failed to install dependencies via apt"; exit 1; }
+        ;;
+    dnf)
+        msg2 "Installing dependencies (dnf)..."
+        KERNEL_MODULES_PKG="kernel-modules-$(uname -r)"
+        rpm -q "$KERNEL_MODULES_PKG" >/dev/null 2>&1 || dnf install -y "$KERNEL_MODULES_PKG" 2>&1 | tee -a "$LOG_FILE" || true
+        dnf install -y kernel-devel kernel-headers gcc make git dkms 2>&1 | tee -a "$LOG_FILE" || { error "Failed to install dependencies via dnf"; exit 1; }
+        ;;
+    *)
+        warning "Could not detect package manager (apt/pacman/dnf). Assuming dependencies are met."
+        ;;
+esac
+
+command -v dkms >/dev/null 2>&1 || { error "DKMS is not installed."; exit 1; }
+check_kernel_consistency
+
+if lsmod | grep -q "$DRV_NAME"; then
+    warning "Module $DRV_NAME is currently loaded."
+    if ! try_unload_module; then
+        if confirm "Force unload now?" "N"; then
+            rmmod -f "$DRV_NAME" 2>/dev/null || { error "Force unload failed."; exit 1; }
+        else
+            die "Cannot proceed while module is in use."
+        fi
+    fi
+fi
+
+# Clean previous DKMS/src trees before staging. Cleanup must run first —
+# calling it after staging deletes the freshly copied /usr/src tree.
+sc0710_dkms_cleanup
+LOCAL_MODE=false
+[[ -f "$PROJECT_ROOT/Makefile" && -f "$PROJECT_ROOT/lib/sc0710.h" ]] && confirm "Use local source?" "Y" && LOCAL_MODE=true
+if [[ "$LOCAL_MODE" == "true" ]]; then
+    mkdir -p "$SRC_DEST"
+    cp -r "$PROJECT_ROOT"/* "$SRC_DEST/"
+else
+    TEMP_DIR=$(mktemp -d -t sc0710.XXXXXX) || die "Failed to create temp directory"
+    clone_sc0710_repo "$TEMP_DIR"
+    if [[ -f "$TEMP_DIR/version" ]]; then
+        DRV_VERSION="$(cat "$TEMP_DIR/version" | tr -d '[:space:]')"
+        DKMS_VERSION="$(sc0710_version_to_dkms "$DRV_VERSION")"
+        SRC_DEST="/usr/src/${DRV_NAME}-${DKMS_VERSION}"
+        SOURCE="$SRC_DEST"
+    fi
+    [[ -d "$SRC_DEST" ]] && rm -rf "$SRC_DEST"
+    mkdir -p "$SRC_DEST"
+    cp -r "$TEMP_DIR"/* "$SRC_DEST/"
+fi
+verify_essential_files "$SRC_DEST" || die "Source verification failed."
+
+if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"; then
+    if [[ ! -f "/var/lib/sc0710/firmware/SC0710.FWI.HEX" && ! -f "/lib/firmware/sc0710/SC0710.FWI.HEX" && ! -f "/etc/firmware/sc0710/SC0710.FWI.HEX" ]]; then
+        msg "4K Pro detected — extracting ECP5 firmware..."
+        [[ -f "$SOURCE/scripts/extract-firmware.sh" ]] && bash "$SOURCE/scripts/extract-firmware.sh" && msg2 "Firmware extracted." || warning "Firmware extraction failed."
+    fi
+    msg "4K Pro detected — installing firmware helper lib..."
+    mkdir -p "/usr/local/libexec"
+    install_4k_pro_firmware_lib "/usr/local/libexec/sc0710-firmware-lib.sh" "$SOURCE"
+fi
+
+USE_DKMS=false
+confirm "Enable automatic updates (DKMS)?" "Y" && USE_DKMS=true
+if [[ "$USE_DKMS" == "true" ]]; then
+    # Ship DKMS helpers system-wide (same layout as aur/PKGBUILD). dkms.conf
+    # MAKE[0] invokes /usr/lib/sc0710/sc0710-dkms-make.sh on rebuilds.
+    install -d /usr/lib/sc0710
+    for _dkms_helper in sc0710-dkms-lib.sh sc0710-dkms-ensure.sh sc0710-dkms-make.sh; do
+        if [[ -f "$SRC_DEST/scripts/$_dkms_helper" ]]; then
+            install -Dm755 "$SRC_DEST/scripts/$_dkms_helper" "/usr/lib/sc0710/$_dkms_helper"
+        else
+            die "Missing DKMS helper: $SRC_DEST/scripts/$_dkms_helper"
+        fi
+    done
+    cat > "$SRC_DEST/dkms.conf" << DKMSEOF
+PACKAGE_NAME="$DRV_NAME"
+PACKAGE_VERSION="$DKMS_VERSION"
+BUILT_MODULE_NAME[0]="$DRV_NAME"
+DEST_MODULE_LOCATION[0]="/kernel/drivers/media/pci/"
+AUTOINSTALL="yes"
+BUILT_MODULE_LOCATION[0]="build/"
+MAKE[0]="bash /usr/lib/sc0710/sc0710-dkms-make.sh \$kernelver"
+DKMSEOF
+    dkms add -m "$DRV_NAME" -v "$DKMS_VERSION" >/dev/null 2>&1 || true
+    dkms build -m "$DRV_NAME" -v "$DKMS_VERSION" -k "$KERNEL_VER" 2>&1 | tee -a "$LOG_FILE" || { error "DKMS build failed."; exit 1; }
+    dkms install -m "$DRV_NAME" -v "$DKMS_VERSION" -k "$KERNEL_VER" --force 2>&1 | tee -a "$LOG_FILE" || { error "DKMS install failed."; exit 1; }
+else
+    cd "$SRC_DEST"
+    make -j"$(nproc)" 2>&1 | tee -a "$LOG_FILE" || { error "Build failed."; exit 1; }
+    mkdir -p "/lib/modules/$KERNEL_VER/kernel/drivers/media/pci/"
+    cp "build/${DRV_NAME}.ko" "/lib/modules/$KERNEL_VER/kernel/drivers/media/pci/"
+    depmod -a
+fi
+
+confirm "Load driver automatically on boot?" "Y" && echo "$DRV_NAME" > "/etc/modules-load.d/${DRV_NAME}.conf" || rm -f "/etc/modules-load.d/${DRV_NAME}.conf"
+echo 'softdep sc0710 pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg videobuf2-common snd-pcm' > /etc/modprobe.d/${DRV_NAME}.conf
+
+msg2 "Loading module..."
+for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
+if lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012" && [[ -f "/usr/local/libexec/sc0710-firmware-lib.sh" ]]; then
+    # shellcheck source=/dev/null
+    SC0710_FW_LOG_FILE="$LOG_FILE" source "/usr/local/libexec/sc0710-firmware-lib.sh"
+    sc0710_init_firmware_paths
+    if sc0710_ensure_ecp5_programmed 3; then
+        msg2 "Driver loaded and ECP5 FPGA programmed."
+    else
+        warning "ECP5 programming failed (card not bound). Check dmesg, ensure the firmware file exists (sudo bash $SOURCE/scripts/extract-firmware.sh), then: sudo modprobe -r sc0710 && sudo modprobe sc0710"
+    fi
+elif ! DRIVER_ERR=$(modprobe "$DRV_NAME" 2>&1); then
+    error "Failed to load $DRV_NAME. Error: $DRIVER_ERR"
+    warning "Driver installed but could not be loaded. It may work after a reboot."
+else
+    msg2 "Driver loaded successfully!"
+fi
+
+fi
+
+# --- 10. Install CLI Tool ---
+msg "Installing CLI utility..."
+if [[ -f "$SOURCE/scripts/sc0710-cli.sh" ]]; then
+    cp "$SOURCE/scripts/sc0710-cli.sh" /usr/local/bin/sc0710-cli
+    chmod +x /usr/local/bin/sc0710-cli
+else
+    warning "scripts/sc0710-cli.sh not found in source. CLI not installed."
+fi
+
+ensure_gui_dependencies
+
+# EDID configuration GUI (launched by `sc0710-cli --edid-config`)
+if [[ -f "$SOURCE/scripts/sc0710-edid-config" ]]; then
+    cp "$SOURCE/scripts/sc0710-edid-config" /usr/local/bin/sc0710-edid-config
+    chmod +x /usr/local/bin/sc0710-edid-config
+    # Bundle Elgato's EDID profiles so the library is populated out of the box
+    # (optional; the GUI can also download them at runtime).
+    if [[ -d "$SOURCE/4KCaptureUtility" ]]; then
+        mkdir -p /usr/share/sc0710/edid
+        find "$SOURCE/4KCaptureUtility" -maxdepth 1 -iname '*.bin' \
+            -exec cp -n {} /usr/share/sc0710/edid/ \; 2>/dev/null || true
+    fi
+else
+    warning "scripts/sc0710-edid-config not found. EDID GUI not installed."
+fi
+
+# HDR / color-depth settings GUI (launched by `sc0710-cli --hdr-config`)
+if [[ -f "$SOURCE/scripts/sc0710-hdr-config" ]]; then
+    cp "$SOURCE/scripts/sc0710-hdr-config" /usr/local/bin/sc0710-hdr-config
+    chmod +x /usr/local/bin/sc0710-hdr-config
+else
+    warning "scripts/sc0710-hdr-config not found. HDR GUI not installed."
+fi
+
+# Driver manager GUI (launched by `sc0710-cli --gui`)
+if [[ -f "$SOURCE/scripts/sc0710-gui" ]]; then
+    cp "$SOURCE/scripts/sc0710-gui" /usr/local/bin/sc0710-gui
+    chmod +x /usr/local/bin/sc0710-gui
+    install_desktop_launcher /usr/local/bin/sc0710-cli
+else
+    warning "scripts/sc0710-gui not found. Manager GUI not installed."
+fi
+
+# Raw EDID writer helper — compiled here (never shipped as a binary).
+if [[ -f "$SOURCE/scripts/mk2-set-edid.c" ]]; then
+    if { command -v cc >/dev/null 2>&1 && cc -O2 -o /usr/local/bin/mk2-set-edid "$SOURCE/scripts/mk2-set-edid.c"; } \
+       || { command -v gcc >/dev/null 2>&1 && gcc -O2 -o /usr/local/bin/mk2-set-edid "$SOURCE/scripts/mk2-set-edid.c"; }; then
+        chmod +x /usr/local/bin/mk2-set-edid
+    else
+        warning "could not compile mk2-set-edid (no C compiler?); skipping the raw EDID writer."
+    fi
+fi
+
+# MK.2 HDR tonemap helper — compiled here (never shipped as a binary).
+if [[ -f "$SOURCE/scripts/mk2-set-tonemap.c" ]]; then
+    if { command -v cc >/dev/null 2>&1 && cc -O2 -lm -o /usr/local/bin/mk2-set-tonemap "$SOURCE/scripts/mk2-set-tonemap.c"; } \
+       || { command -v gcc >/dev/null 2>&1 && gcc -O2 -lm -o /usr/local/bin/mk2-set-tonemap "$SOURCE/scripts/mk2-set-tonemap.c"; }; then
+        chmod +x /usr/local/bin/mk2-set-tonemap
+    else
+        warning "could not compile mk2-set-tonemap (no C compiler?); skipping the tonemap helper."
+    fi
+fi
+
+
+# --- Final Success Message ---
+log "=== Installation completed successfully ==="
+echo ""
+echo -e "${BOLD}${GREEN}::${NC} ${BOLD}Installation Complete.${NC}"
+echo ""
+if is_steamos; then
+    echo -e " ${BLUE}->${NC} Installed for: ${BOLD}${DISTRO_NAME:-SteamOS}${NC}"
+    echo ""
+    echo -e " ${BLUE}->${NC} ${BOLD}How it works on SteamOS:${NC}"
+    echo -e "    The driver source lives in ${BOLD}${SRC_DIR}/${NC} — on /home, the only partition"
+    echo -e "    a SteamOS A/B update leaves untouched (${BOLD}/var/lib/sc0710${NC} links to it)."
+    echo -e "    ${BOLD}sc0710-build.service${NC} runs on every boot and, after a SteamOS update,"
+    echo -e "    re-installs the Neptune kernel headers, rebuilds the module and puts"
+    echo -e "    ${BOLD}sc0710-cli${NC} back into /usr/local/bin by itself."
+    echo ""
+    if [[ "${SC0710_STEAMOS_ORIG_LOCKED:-1}" == "1" ]]; then
+        echo -e "    The read-only rootfs is re-locked as this installer exits."
+    else
+        echo -e "    The rootfs was already unlocked before this install; it is left that way."
+    fi
+    echo -e "    If an update ever removes the boot service itself, restore it offline with:"
+    echo -e "      ${BOLD}sudo bash ${SRC_DIR}/steamos-restore.sh${NC}"
+elif [[ "$IS_ATOMIC" == "true" ]]; then
+    echo -e " ${BLUE}->${NC} Installed for: ${BOLD}${DISTRO_NAME:-Fedora Atomic}${NC}"
+    echo ""
+    echo -e " ${BLUE}->${NC} ${BOLD}How it works on atomic distros:${NC}"
+    echo -e "    The driver source is stored in ${BOLD}/var/lib/sc0710/${NC} (persists across updates)."
+    echo -e "    A systemd service (${BOLD}sc0710-build.service${NC}) automatically rebuilds the"
+    echo -e "    module on each boot if the kernel version has changed."
+fi
+echo ""
+echo -e " ${BLUE}->${NC} New command available: ${BOLD}sc0710-cli${NC}"
+echo -e "    Usage:"
+echo -e "      ${BOLD}sc0710-cli -s${NC}  or  ${BOLD}--status${NC}   Check driver health"
+echo -e "      ${BOLD}sc0710-cli -l${NC}  or  ${BOLD}--load${NC}     Load driver"
+echo -e "      ${BOLD}sc0710-cli -u${NC}  or  ${BOLD}--unload${NC}   Unload driver"
+echo -e "      ${BOLD}sc0710-cli --restart${NC}        Reload driver"
+echo -e "      ${BOLD}sc0710-cli -d${NC}  or  ${BOLD}--debug${NC}    Toggle debug output"
+echo -e "      ${BOLD}sc0710-cli -it${NC} or  ${BOLD}--image-toggle${NC}  Toggle status images"
+echo -e "      ${BOLD}sc0710-cli -pt${NC} or ${BOLD}--procedural-timings${NC} Toggle timing calculation mode"
+echo -e "      ${BOLD}sc0710-cli -ec${NC} or ${BOLD}--edid-config${NC} Open EDID configuration GUI"
+echo -e "      ${BOLD}sc0710-cli -hc${NC} or ${BOLD}--hdr-config${NC}  Open HDR / color settings GUI"
+echo -e "      ${BOLD}sc0710-cli -g${NC}  or ${BOLD}--gui${NC}         Open driver manager GUI"
+echo -e "      ${BOLD}sc0710-cli -ht${NC} or ${BOLD}--hdr-toggle${NC} Cycle HDR mode (tonemap ↔ passthrough ↔ SDR)"
+echo -e ""
+echo -e "      ${BOLD}sc0710-cli --rebuild${NC}        Force rebuild for current kernel"
+echo -e "      ${BOLD}sc0710-cli -U${NC}  or  ${BOLD}--update${NC}   Pull latest & rebuild"
+echo -e "      ${BOLD}sc0710-cli -r/R${NC} or ${BOLD}--remove${NC} Complete uninstall"
+echo -e "      ${BOLD}sc0710-cli -h${NC}  or  ${BOLD}--help${NC}     Show all options"
+echo ""
+echo -e " ${BLUE}->${NC} Installation log available at: ${BOLD}$LOG_FILE${NC}"
+echo ""
+
+if [[ "$VIDEO_GROUP_CHANGED" == "true" ]]; then
+    echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║                 IMPORTANT NOTICE                          ║${NC}"
+    echo -e "${YELLOW}╠═══════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${YELLOW}║${NC}  User permissions have been updated.                      ${YELLOW}║${NC}"
+    echo -e "${YELLOW}║${NC}  You ${BOLD}MUST REBOOT${NC} or ${BOLD}LOG OUT${NC} and back in for changes       ${YELLOW}║${NC}"
+    echo -e "${YELLOW}║${NC}  to take effect. OBS will NOT detect the card otherwise.  ${YELLOW}║${NC}"
+    echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+fi

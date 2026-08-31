@@ -1,0 +1,2260 @@
+#!/usr/bin/env bash
+# Copyright (C) 2025-2026 Nakildias <nakildiaspro@gmail.com>
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# SC0710 Control Utility - Unified for Atomic and Non-Atomic distros
+# Detects distro type at runtime and branches accordingly.
+
+# --- Configuration ---
+VERSION_URL="https://raw.githubusercontent.com/Nakildias/sc0710/main/version"
+DRV_NAME="sc0710"
+
+# --- Colors ---
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+BLUE='\033[1;34m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# --- EDID / HDR / Manager GUIs (run as the invoking user, NOT root) ---
+# Handled before full auto-elevation: Qt needs the user's display session.
+# Privilege for writes uses the same sudo ticket as the rest of sc0710-cli
+# (cached after `sudo -v` here so Apply does not re-prompt every time).
+if [[ "$1" == "-ec" || "$1" == "--edid-config" ||
+      "$1" == "-hc" || "$1" == "--hdr-config" ||
+      "$1" == "-g" || "$1" == "--gui" ]]; then
+    _cli_self="$(readlink -f "${BASH_SOURCE[0]:-$0}" 2>/dev/null || echo "$0")"
+    _cli_dir="$(dirname "$_cli_self")"
+    if [[ "$1" == "-hc" || "$1" == "--hdr-config" ]]; then
+        _gui_name="sc0710-hdr-config"
+        _gui_label="HDR"
+    elif [[ "$1" == "-g" || "$1" == "--gui" ]]; then
+        _gui_name="sc0710-gui"
+        _gui_label="Driver Manager"
+    else
+        _gui_name="sc0710-edid-config"
+        _gui_label="EDID"
+    fi
+    # A .desktop launch has no controlling terminal, so a plain "echo; exit 1"
+    # here is invisible — it looks exactly like nothing happened at all.
+    # Surface every early failure as a desktop notification too, whenever one
+    # is available (present on every DE this driver targets: GNOME, KDE/Plasma
+    # including SteamOS Desktop Mode, XFCE).
+    _gui_notify_fail() {
+        command -v notify-send >/dev/null 2>&1 && \
+            notify-send -u critical "SC0710 ${_gui_label}" "$1" 2>/dev/null
+        return 0
+    }
+
+    _GUI=""
+    for _p in \
+        "$_cli_dir/${_gui_name}" \
+        "$_cli_dir/../scripts/${_gui_name}" \
+        "/usr/local/bin/${_gui_name}" \
+        "/usr/local/libexec/${_gui_name}" \
+        "/usr/lib/sc0710/${_gui_name}" \
+        "/usr/bin/${_gui_name}"; do
+        [[ -f "$_p" ]] && { _GUI="$(readlink -f "$_p")"; break; }
+    done
+    if [[ -z "$_GUI" ]]; then
+        echo -e "${RED}[ERROR]${NC} ${_gui_name} not found. Reinstall the driver package."
+        _gui_notify_fail "${_gui_name} not found. Reinstall the driver package."
+        exit 1
+    fi
+    if ! lsmod | grep -q "^${DRV_NAME} "; then
+        echo -e "${YELLOW}[WARN]${NC} Driver not loaded — run ${BOLD}sc0710-cli --load${NC} first, or the GUI will show no card."
+    fi
+    if ! python3 -c 'import PySide6' 2>/dev/null && ! python3 -c 'import PyQt6' 2>/dev/null; then
+        echo -e "${YELLOW}[INFO]${NC} The ${_gui_label} GUI needs a Qt binding (PySide6). Install it with:"
+        echo -e "    Arch/SteamOS: ${BOLD}sudo pacman -S pyside6${NC}"
+        echo -e "    Fedora:       ${BOLD}sudo dnf install python3-pyside6${NC} (or rpm-ostree install, then reboot)"
+        echo -e "    Debian:       ${BOLD}sudo apt install python3-pyside6.qtcore python3-pyside6.qtgui python3-pyside6.qtwidgets${NC}"
+        _gui_notify_fail "Needs a Qt binding (PySide6). Run: sudo pacman -S pyside6 (see terminal / sc0710-cli --gui for other distros)."
+        exit 1
+    fi
+    # Privileged writes (-g/--gui, -hc/--hdr-config) elevate per-action via
+    # pkexec, so the desktop's own polkit agent prompts as needed — no
+    # priming here, and no controlling terminal required (this is what lets
+    # a plain double-click from the app grid work). -ec/--edid-config never
+    # needs elevation (device nodes are group "video"). Only without pkexec
+    # do we fall back to sc0710-cli's old sudo-ticket priming, which needs a
+    # terminal to prompt in.
+    if [[ $EUID -ne 0 ]] && ! command -v pkexec >/dev/null 2>&1 && \
+       [[ "$1" == "-g" || "$1" == "--gui" || "$1" == "-hc" || "$1" == "--hdr-config" ]]; then
+        if ! sudo -v; then
+            echo -e "${RED}[ERROR]${NC} sudo authentication required for ${_gui_label}."
+            _gui_notify_fail "sudo authentication required, and no terminal is attached to prompt in."
+            exit 1
+        fi
+    fi
+    exec python3 "$_GUI"
+fi
+
+# --- Auto-elevate to root ---
+if [[ $EUID -ne 0 ]]; then
+    exec sudo SC0710_INVOKE_USER="$USER" "$0" "$@"
+fi
+DUMP_USER="${SC0710_INVOKE_USER:-${SUDO_USER:-root}}"
+
+# --- SteamOS support ---
+# SteamOS is immutable like Bazzite but locks / behind `steamos-readonly`, so
+# every write to /etc, /usr/local or /lib/modules needs an unlock first. The
+# helper library also knows where the persistent source tree lives.
+IS_STEAMOS=false
+for _steamos_lib in /home/sc0710/sc0710-steamos-lib.sh \
+                    /var/lib/sc0710/sc0710-steamos-lib.sh \
+                    /usr/lib/sc0710/sc0710-steamos-lib.sh \
+                    "$(dirname "$(readlink -f "${BASH_SOURCE[0]:-$0}")")/sc0710-steamos-lib.sh"; do
+    if [[ -f "$_steamos_lib" ]]; then
+        # shellcheck source=/dev/null
+        source "$_steamos_lib"
+        sc0710_is_steamos && IS_STEAMOS=true
+        break
+    fi
+done
+
+is_steamos() {
+    [[ "$IS_STEAMOS" == "true" ]]
+}
+
+# Banner suffix: "SteamOS Edition" / "Atomic Edition" / "".
+sc0710_edition_label() {
+    if is_steamos; then
+        printf ' (SteamOS Edition)'
+    elif [[ -f /run/ostree-booted ]] || command -v rpm-ostree &>/dev/null; then
+        printf ' (Atomic Edition)'
+    fi
+}
+
+# Unlock the rootfs for the current command and re-lock it on exit. Idempotent
+# and a no-op off SteamOS, so write sites can just call it.
+STEAMOS_RW_ACTIVE=false
+steamos_rw() {
+    is_steamos || return 0
+    [[ "$STEAMOS_RW_ACTIVE" == "true" ]] && return 0
+    if ! sc0710_steamos_unlock; then
+        echo -e "${RED}[ERROR]${NC} Could not unlock the SteamOS rootfs."
+        echo -e "  Run ${BOLD}sudo steamos-readonly disable${NC} and try again."
+        return 1
+    fi
+    STEAMOS_RW_ACTIVE=true
+    trap 'sc0710_steamos_relock' EXIT
+    return 0
+}
+
+# --- Detect atomic distro ---
+# SteamOS counts as atomic here: same immutable layout (source tree rebuilt at
+# boot, module insmod'ed from it) even though the package manager differs.
+is_atomic() {
+    [[ -f /run/ostree-booted ]] && return 0
+    command -v rpm-ostree &>/dev/null && return 0
+    is_steamos
+}
+
+# --- Resolve version and paths ---
+if is_atomic; then
+    IS_ATOMIC=true
+    SRC_DIR="/var/lib/sc0710"
+    # SteamOS: /var is an A/B partition, so the compat symlink can be missing
+    # after an OS update even though the source tree in /home survived.
+    if is_steamos && [[ ! -e "$SRC_DIR" && -d "$SC0710_STEAMOS_HOME" ]]; then
+        sc0710_steamos_ensure_layout 2>/dev/null || SRC_DIR="$SC0710_STEAMOS_HOME"
+    fi
+    if [[ -f "$SRC_DIR/version" ]]; then
+        CURRENT_VERSION="$(cat "$SRC_DIR/version" | tr -d '[:space:]')"
+    else
+        CURRENT_VERSION="$(curl -fsSL "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')"
+    fi
+else
+    IS_ATOMIC=false
+    SRC_DIR=""
+    DKMS_SRC=""
+    for d in /usr/src/${DRV_NAME}-*; do
+        [[ -d "$d" ]] && DKMS_SRC="$d" && break
+    done
+    if [[ -n "$DKMS_SRC" && -f "$DKMS_SRC/version" ]]; then
+        CURRENT_VERSION="$(cat "$DKMS_SRC/version" | tr -d '[:space:]')"
+    else
+        CURRENT_VERSION="$(curl -fsSL "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')"
+    fi
+fi
+
+# --- Persistence Function ---
+#
+# Parameters carried across a --restart. A parameter missing from this list
+# silently reverts to its compiled-in default on every reload, which is very
+# hard to spot: the module reloads cleanly and just behaves as if nothing was
+# set. Add new persistable module parameters here.
+SC0710_PERSIST_PARAMS=(
+    sc0710_debug_mode
+    use_status_images
+    procedural_timings
+    keep_audio_alive
+    hdmi_rate_decode
+    dma_short_desc_detect
+)
+
+save_config() {
+    local pdir=/sys/module/sc0710/parameters
+    local opts="" name value
+
+    for name in "${SC0710_PERSIST_PARAMS[@]}"; do
+        if [[ -r "$pdir/$name" ]]; then
+            value=$(cat "$pdir/$name" 2>/dev/null) || continue
+        elif [[ "$name" == "sc0710_debug_mode" && -r "$pdir/debug" ]]; then
+            # Older builds named the debug parameter differently.
+            value=$(cat "$pdir/debug" 2>/dev/null) || continue
+        else
+            # Not present in this build; persisting it would make the
+            # module fail to load.
+            continue
+        fi
+        opts="$opts $name=$value"
+    done
+
+    if [[ -z "$opts" ]]; then
+        echo -e "${YELLOW}[PERSIST]${NC} Module not loaded — nothing to save."
+        return 0
+    fi
+
+    steamos_rw || { echo -e "${YELLOW}[WARN]${NC} Settings not persisted (rootfs is read-only)."; return 0; }
+    echo "options sc0710$opts" > /etc/modprobe.d/sc0710-params.conf
+    echo -e "${BLUE}[PERSIST]${NC} Settings saved to /etc/modprobe.d/sc0710-params.conf"
+    echo -e "  ${BOLD}options sc0710$opts${NC}"
+}
+
+sc0710_is_4k_pro_card() {
+    local fw_lib=""
+
+    if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+        fw_lib="$SRC_DIR/sc0710-firmware-lib.sh"
+    elif [[ -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
+        fw_lib="/usr/lib/sc0710/sc0710-firmware-lib.sh"
+    elif [[ -f /usr/local/libexec/sc0710-firmware-lib.sh ]]; then
+        fw_lib="/usr/local/libexec/sc0710-firmware-lib.sh"
+    fi
+
+    if [[ -n "$fw_lib" ]]; then
+        # shellcheck source=/dev/null
+        source "$fw_lib"
+        sc0710_is_4k_pro
+        return $?
+    fi
+
+    lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"
+}
+
+sc0710_dkms_lib_path() {
+    local path cli_dir
+    for path in \
+        /usr/lib/sc0710/sc0710-dkms-lib.sh \
+        "$(dirname "$(sc0710_cli_path)")/sc0710-dkms-lib.sh" \
+        "$(dirname "$(sc0710_cli_path)")/../scripts/sc0710-dkms-lib.sh"; do
+        [[ -n "$path" && -f "$path" ]] || continue
+        printf '%s\n' "$path"
+        return 0
+    done
+    return 1
+}
+
+sc0710_version_to_dkms() {
+    local ver="${1//[[:space:]]/}"
+    if [[ "$ver" == *-* ]]; then
+        printf '%s.%s' "${ver%-*}" "${ver##*-}"
+    else
+        printf '%s' "$ver"
+    fi
+}
+
+sc0710_dkms_run_cleanup() {
+    local ver_item dkms_lib
+
+    if dkms_lib=$(sc0710_dkms_lib_path); then
+        # shellcheck source=/dev/null
+        if source "$dkms_lib" && declare -F sc0710_dkms_cleanup >/dev/null 2>&1; then
+            sc0710_dkms_cleanup
+            return 0
+        fi
+    fi
+
+    lsmod | grep -q "^${DRV_NAME} " && rmmod "$DRV_NAME" 2>/dev/null || true
+    for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' "/^${DRV_NAME}/ {print \$1}" | tr -d ' '); do
+        dkms remove "$ver_item" --all >/dev/null 2>&1 || \
+            rm -rf "/var/lib/dkms/$(echo "$ver_item" | tr ',' '/')" 2>/dev/null
+    done
+    rmdir "/var/lib/dkms/${DRV_NAME}" 2>/dev/null || true
+    rm -rf /usr/src/${DRV_NAME}-*
+    find /usr/lib/modules -path "*/updates/dkms/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    find /usr/lib/modules -path "*/kernel/drivers/media/pci/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    depmod -a >/dev/null 2>&1 || true
+}
+
+sc0710_firmware_lib_path() {
+    if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/sc0710-firmware-lib.sh" ]]; then
+        echo "$SRC_DIR/sc0710-firmware-lib.sh"
+    elif [[ -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
+        echo "/usr/lib/sc0710/sc0710-firmware-lib.sh"
+    elif [[ -f /usr/local/libexec/sc0710-firmware-lib.sh ]]; then
+        echo "/usr/local/libexec/sc0710-firmware-lib.sh"
+    fi
+}
+
+# Installed extract-firmware.sh, per layout: AUR, atomic source dir, DKMS source dir.
+sc0710_extract_script_path() {
+    local p
+    for p in /usr/lib/sc0710/extract-firmware.sh \
+             "$SRC_DIR/scripts/extract-firmware.sh" \
+             "$DKMS_SRC/scripts/extract-firmware.sh"; do
+        [[ -f "$p" ]] && { echo "$p"; return 0; }
+    done
+    echo "scripts/extract-firmware.sh (from the repo)"
+}
+
+sc0710_cli_path() {
+    readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}"
+}
+
+sc0710_installed_aur_package() {
+    local pkg owner
+
+    command -v pacman &>/dev/null || return 1
+    for pkg in sc0710-dkms-git sc0710-dkms; do
+        pacman -Q "$pkg" &>/dev/null && {
+            printf '%s' "$pkg"
+            return 0
+        }
+    done
+
+    if [[ -x /usr/bin/sc0710-cli ]]; then
+        owner=$(pacman -Qo /usr/bin/sc0710-cli 2>/dev/null | awk '{print $NF}' || true)
+        case "$owner" in
+            sc0710-dkms-git|sc0710-dkms)
+                printf '%s' "$owner"
+                return 0
+                ;;
+        esac
+    fi
+
+    return 1
+}
+
+sc0710_detect_aur_helper() {
+    local helper
+
+    for helper in yay paru trizen pikaur aura; do
+        command -v "$helper" &>/dev/null && {
+            printf '%s' "$helper"
+            return 0
+        }
+    done
+    command -v pacman &>/dev/null && {
+        printf '%s' "pacman"
+        return 0
+    }
+    return 1
+}
+
+sc0710_run_as_invoke_user() {
+    local user="${SC0710_INVOKE_USER:-${SUDO_USER:-root}}"
+
+    if [[ -z "$user" || "$user" == root ]]; then
+        "$@"
+    else
+        sudo -u "$user" -H "$@"
+    fi
+}
+
+sc0710_cli_remove_desktop_launchers() {
+    local user home
+    for user in $(awk -F: '$3 >= 1000 && $3 < 65000 {print $1}' /etc/passwd); do
+        id "$user" >/dev/null 2>&1 || continue
+        home=$(getent passwd "$user" | cut -d: -f6)
+        [[ -n "$home" ]] || continue
+        rm -f "${home}/.local/share/applications/sc0710-gui.desktop" 2>/dev/null || true
+    done
+}
+
+sc0710_cli_remove_user_state() {
+    sc0710_remove_firmware_files
+    systemctl stop sc0710-firmware.service 2>/dev/null || true
+    systemctl disable sc0710-firmware.service 2>/dev/null || true
+    systemctl stop sc0710-firmware-verify.service 2>/dev/null || true
+    systemctl disable sc0710-firmware-verify.service 2>/dev/null || true
+    rm -f /etc/systemd/system/sc0710-firmware.service
+    rm -f /etc/systemd/system/sc0710-firmware-verify.service
+    rm -f /etc/modules-load.d/${DRV_NAME}.conf /etc/modprobe.d/${DRV_NAME}.conf \
+        /etc/modprobe.d/${DRV_NAME}-params.conf /etc/modprobe.d/${DRV_NAME}-atomic.conf
+    systemctl daemon-reload 2>/dev/null || true
+    rm -rf /var/log/sc0710
+    sc0710_cli_remove_desktop_launchers
+}
+
+sc0710_cli_remove_aur_install() {
+    local pkg="$1" helper
+
+    helper=$(sc0710_detect_aur_helper) || {
+        echo -e "${RED}[ERROR]${NC} No AUR helper or pacman found."
+        return 1
+    }
+
+    echo -e "${BLUE}[INFO]${NC} AUR install detected. Removing ${BOLD}${pkg}${NC} via ${BOLD}${helper} -R ${pkg}${NC}..."
+    sc0710_cli_remove_user_state
+
+    if [[ "$helper" == pacman ]]; then
+        pacman -R "$pkg" || return 1
+    else
+        sc0710_run_as_invoke_user "$helper" -R "$pkg" || return 1
+    fi
+
+    echo -e "${GREEN}[OK]${NC} ${pkg} removed via ${helper}."
+}
+
+sc0710_detect_install_method() {
+    local pkg cli_path
+
+    if pkg=$(sc0710_installed_aur_package); then
+        printf 'AUR (%s %s)' "$pkg" "$(pacman -Q "$pkg" | awk '{print $2}')"
+        return 0
+    fi
+
+    if [[ "$IS_ATOMIC" == "true" && -d /var/lib/sc0710 ]]; then
+        is_steamos && printf 'GitHub (SteamOS installer)' || printf 'GitHub (atomic installer)'
+        return 0
+    fi
+
+    if [[ -x /usr/local/bin/sc0710-cli ]] || [[ -f /usr/local/libexec/sc0710-firmware.sh ]]; then
+        printf 'GitHub (install-sc0710.sh)'
+        return 0
+    fi
+
+    cli_path=$(sc0710_cli_path)
+    case "$cli_path" in
+        /usr/bin/sc0710-cli)
+            if [[ -f /usr/lib/sc0710/sc0710-firmware-lib.sh ]]; then
+                printf 'AUR (sc0710-dkms-git, package database not found)'
+                return 0
+            fi
+            ;;
+        /usr/local/bin/sc0710-cli)
+            printf 'GitHub (install-sc0710.sh)'
+            return 0
+            ;;
+    esac
+
+    if [[ "$cli_path" != /usr/bin/sc0710-cli && "$cli_path" != /usr/local/bin/sc0710-cli ]]; then
+        printf 'Development (local script: %s)' "$cli_path"
+        return 0
+    fi
+
+    printf 'Unknown'
+}
+
+sc0710_cli_ensure_ecp5() {
+    local attempts="${1:-3}"
+    local fw_lib fw_script
+    sc0710_is_4k_pro_card || return 0
+    fw_lib=$(sc0710_firmware_lib_path) || return 1
+    mkdir -p /var/log/sc0710
+    # shellcheck source=/dev/null
+    SC0710_FW_LOG_FILE="/var/log/sc0710/cli_$(date '+%Y%m%d_%H%M%S').log" source "$fw_lib"
+    sc0710_init_firmware_paths
+    sc0710_ensure_ecp5_programmed "$attempts"
+}
+
+sc0710_cli_atomic_load() {
+    local fw_lib err
+
+    if fw_lib=$(sc0710_firmware_lib_path 2>/dev/null); then
+        mkdir -p /var/log/sc0710
+        # shellcheck source=/dev/null
+        SC0710_FW_LOG_FILE="/var/log/sc0710/load_$(date '+%Y%m%d_%H%M%S').log" source "$fw_lib"
+        sc0710_init_firmware_paths
+        sc0710_load_driver
+        return $?
+    fi
+
+    local extra_dir="/lib/modules/$(uname -r)/extra/${DRV_NAME}"
+    rmmod "$DRV_NAME" 2>/dev/null || true
+    if [[ -d "$extra_dir" ]]; then
+        rm -rf "$extra_dir"
+        depmod -a "$(uname -r)" 2>/dev/null || depmod -a 2>/dev/null || true
+    fi
+    for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do
+        modprobe "$dep" 2>/dev/null || true
+    done
+    err=$(insmod "$SRC_DIR/build/${DRV_NAME}.ko" 2>&1) || {
+        [[ -n "$err" ]] && echo "$err" >&2
+        return 1
+    }
+    return 0
+}
+
+sc0710_cli_clear_stale_registration() {
+    local fw_lib extra_dir="/lib/modules/$(uname -r)/extra/${DRV_NAME}"
+
+    if fw_lib=$(sc0710_firmware_lib_path 2>/dev/null); then
+        mkdir -p /var/log/sc0710
+        # shellcheck source=/dev/null
+        SC0710_FW_LOG_FILE="/var/log/sc0710/remove_$(date '+%Y%m%d_%H%M%S').log" source "$fw_lib"
+        sc0710_init_firmware_paths
+        sc0710_clear_stale_kernel_registration
+        return 0
+    fi
+
+    rmmod "$DRV_NAME" 2>/dev/null || true
+    if [[ -d "$extra_dir" ]]; then
+        rm -rf "$extra_dir" 2>/dev/null || true
+        depmod -a "$(uname -r)" 2>/dev/null || depmod -a 2>/dev/null || true
+    fi
+    if [[ "$IS_ATOMIC" == "true" ]]; then
+        cat > "/etc/modprobe.d/${DRV_NAME}-atomic.conf" <<EOF
+blacklist ${DRV_NAME}
+EOF
+    fi
+}
+
+sc0710_remove_firmware_files() {
+    rm -f /lib/firmware/sc0710/SC0710.FWI.HEX 2>/dev/null || true
+    rm -rf /lib/firmware/sc0710/edid 2>/dev/null || true
+    rmdir /lib/firmware/sc0710 2>/dev/null || true
+
+    rm -f /etc/firmware/sc0710/SC0710.FWI.HEX /etc/firmware/sc0710/edid 2>/dev/null || true
+    if [[ -L /etc/firmware/sc0710 ]]; then
+        rm -f /etc/firmware/sc0710 2>/dev/null || true
+    fi
+    rmdir /etc/firmware/sc0710 2>/dev/null || true
+
+    rm -f /var/lib/sc0710/firmware/SC0710.FWI.HEX 2>/dev/null || true
+    rm -rf /var/lib/sc0710/firmware/edid 2>/dev/null || true
+    rmdir /var/lib/sc0710/firmware 2>/dev/null || true
+
+    rm -f /usr/local/libexec/sc0710-firmware-lib.sh 2>/dev/null || true
+}
+
+# --- Version Check Function ---
+SC0710_BOX_WIDTH=59
+SC0710_BOX_RULE='═══════════════════════════════════════════════════════════'
+
+sc0710_box_border() {
+    local frame="$1" type="$2"
+    local left right
+
+    case "$type" in
+        top) left='╔'; right='╗' ;;
+        mid) left='╠'; right='╣' ;;
+        bot) left='╚'; right='╝' ;;
+    esac
+    printf '%b%s%s%s%b\n' "$frame" "$left" "$SC0710_BOX_RULE" "$right" "$NC"
+}
+
+sc0710_box_line() {
+    local frame="$1" plain="$2" rendered="${3:-$2}"
+    local pad=$(( SC0710_BOX_WIDTH - ${#plain} ))
+
+    (( pad < 0 )) && pad=0
+    printf '%b║%b%*s%b║%b\n' "$frame" "$rendered" "$pad" "" "$frame" "$NC"
+}
+
+sc0710_version_state() {
+    local local_ver="$1" remote_ver="$2"
+
+    [[ -z "$local_ver" || -z "$remote_ver" ]] && { echo "unknown"; return; }
+    [[ "$local_ver" == "$remote_ver" ]] && { echo "current"; return; }
+    if [[ "$(printf '%s\n' "$local_ver" "$remote_ver" | sort -V | head -1)" == "$local_ver" ]]; then
+        echo "behind"
+    else
+        echo "ahead"
+    fi
+}
+
+check_version() {
+    local REMOTE_VERSION state
+    REMOTE_VERSION=$(curl -fsSL "$VERSION_URL" 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$REMOTE_VERSION" ]] && return 0
+
+    state=$(sc0710_version_state "$CURRENT_VERSION" "$REMOTE_VERSION")
+
+    case "$state" in
+        behind)
+            echo ""
+            sc0710_box_border "$YELLOW" top
+            sc0710_box_line "$YELLOW" "   UPDATE AVAILABLE"
+            sc0710_box_border "$YELLOW" mid
+            sc0710_box_line "$YELLOW" "  Current: ${CURRENT_VERSION}" "  Current: ${RED}${CURRENT_VERSION}${NC}"
+            sc0710_box_line "$YELLOW" "  Latest:  ${REMOTE_VERSION}" "  Latest:  ${GREEN}${REMOTE_VERSION}${NC}"
+            sc0710_box_border "$YELLOW" mid
+            sc0710_box_line "$YELLOW" "  Run sc0710-cli -U or sc0710-cli --update to update" "  Run ${BOLD}sc0710-cli -U${NC} or ${BOLD}sc0710-cli --update${NC} to update"
+            sc0710_box_border "$YELLOW" bot
+            echo ""
+            ;;
+        ahead)
+            echo ""
+            sc0710_box_border "$BLUE" top
+            sc0710_box_line "$BLUE" "   PRE-RELEASE"
+            sc0710_box_border "$BLUE" mid
+            sc0710_box_line "$BLUE" "  Installed: ${CURRENT_VERSION} (newer than published)" "  Installed: ${GREEN}${CURRENT_VERSION}${NC} (newer than published)"
+            sc0710_box_line "$BLUE" "  Published: ${REMOTE_VERSION}" "  Published: ${BOLD}${REMOTE_VERSION}${NC}"
+            sc0710_box_border "$BLUE" mid
+            sc0710_box_line "$BLUE" "  You are running a pre-release build. No update needed."
+            sc0710_box_border "$BLUE" bot
+            echo ""
+            ;;
+    esac
+}
+
+# --- Debug Dump Helpers ---
+resolve_dump_desktop() {
+    local home uid desktop
+    if [[ "$DUMP_USER" == "root" ]]; then
+        DUMP_DESKTOP="/root/Desktop"
+    else
+        home=$(getent passwd "$DUMP_USER" 2>/dev/null | cut -d: -f6)
+        uid=$(id -u "$DUMP_USER" 2>/dev/null || echo "")
+        if [[ -n "$uid" && -d "/run/user/$uid" ]]; then
+            desktop=$(sudo -u "$DUMP_USER" XDG_RUNTIME_DIR="/run/user/$uid" xdg-user-dir DESKTOP 2>/dev/null || true)
+        fi
+        [[ -z "$desktop" && -n "$home" ]] && desktop="${home}/Desktop"
+        [[ -z "$desktop" && -n "$home" ]] && desktop="$home"
+        DUMP_DESKTOP="${desktop:-/root/Desktop}"
+    fi
+    mkdir -p "$DUMP_DESKTOP"
+}
+
+# --- PCIe Link & Bandwidth Analysis ---
+#
+# Most "image tears / shifts / goes green and never recovers" reports come
+# down to the card's DMA being starved on a PCIe link that has no headroom
+# left. The card is Gen2 x4 by design, so a 4K60 stream can sit at >90% of
+# usable link bandwidth; any competing traffic on a shared uplink then
+# truncates a transfer mid-frame. That is invisible in dmesg, so this
+# section works it out from the link's own capabilities instead.
+
+# Bytes/sec per lane, after 8b/10b (Gen1/2) or 128b/130b (Gen3+) encoding.
+pcie_lane_bytes() {
+    case "$1" in
+        "2.5 GT/s"*)  echo 250000000 ;;
+        "5.0 GT/s"*|"5 GT/s"*) echo 500000000 ;;
+        "8.0 GT/s"*|"8 GT/s"*) echo 984615384 ;;
+        "16.0 GT/s"*|"16 GT/s"*) echo 1969230769 ;;
+        "32.0 GT/s"*|"32 GT/s"*) echo 3938461538 ;;
+        *) echo 0 ;;
+    esac
+}
+
+# Find the card's PCI address(es) by vendor/device, not by driver binding,
+# so an unbound or failed card is still analysed.
+sc0710_find_bdfs() {
+    local d vendor device
+    for d in /sys/bus/pci/devices/*; do
+        [[ -r "$d/vendor" && -r "$d/device" ]] || continue
+        vendor=$(cat "$d/vendor" 2>/dev/null)
+        device=$(cat "$d/device" 2>/dev/null)
+        if [[ "$vendor" == "0x12ab" && ( "$device" == "0x0710" || "$device" == "0x0380" ) ]]; then
+            basename "$d"
+        fi
+    done
+}
+
+# Walk from the card up to the root complex. A card whose path passes
+# through a chipset/PCH switch shares that uplink with USB, NVMe and
+# networking; a card on CPU-direct lanes does not.
+sc0710_pcie_path() {
+    local bdf="$1" real path node
+    real=$(readlink -f "/sys/bus/pci/devices/$bdf" 2>/dev/null) || return
+    path=""
+    # The sysfs path is .../pci0000:00/0000:00:1c.4/0000:af:00.0
+    for node in $(echo "$real" | tr '/' '\n' | grep -E '^0000:[0-9a-f]{2}:'); do
+        [[ -n "$path" ]] && path="$path -> "
+        path="$path$node"
+    done
+    echo "$path"
+}
+
+# Sets: PCIE_CUR_SPEED PCIE_CUR_WIDTH PCIE_MAX_SPEED PCIE_MAX_WIDTH
+#       PCIE_MPS PCIE_USABLE PCIE_PATH PCIE_UPSTREAM_COUNT
+sc0710_pcie_probe() {
+    local bdf="$1" sysfs="/sys/bus/pci/devices/$1" lane
+    PCIE_CUR_SPEED=$(cat "$sysfs/current_link_speed" 2>/dev/null || echo "unknown")
+    PCIE_CUR_WIDTH=$(cat "$sysfs/current_link_width" 2>/dev/null || echo 0)
+    PCIE_MAX_SPEED=$(cat "$sysfs/max_link_speed" 2>/dev/null || echo "unknown")
+    PCIE_MAX_WIDTH=$(cat "$sysfs/max_link_width" 2>/dev/null || echo 0)
+    PCIE_PATH=$(sc0710_pcie_path "$bdf")
+    # The path is <root port> -> [bridges...] -> <card>. A card on
+    # CPU-direct lanes sits directly under its root port, so it has exactly
+    # one hop; anything more means a switch or the chipset is in between.
+    PCIE_UPSTREAM_COUNT=$(( $(echo "$PCIE_PATH" | grep -o '\->' | wc -l) - 1 ))
+    [[ "$PCIE_UPSTREAM_COUNT" -lt 0 ]] && PCIE_UPSTREAM_COUNT=0
+
+    # MaxPayload is what the whole path negotiated; it sets TLP efficiency.
+    PCIE_MPS=$(lspci -vvv -s "$bdf" 2>/dev/null | grep -oP 'MaxPayload \K[0-9]+' | head -1)
+    [[ -z "$PCIE_MPS" ]] && PCIE_MPS=0
+
+    lane=$(pcie_lane_bytes "$PCIE_CUR_SPEED")
+    if [[ "$lane" -gt 0 && "$PCIE_CUR_WIDTH" -gt 0 ]]; then
+        # TLP overhead: each payload carries ~24 bytes of header/CRC/sequence.
+        # At MPS 128 that is ~84% of raw; at 512, ~96%. Unknown MPS is
+        # assumed to be the 128-byte default, which is the common case.
+        local mps=${PCIE_MPS:-128}
+        [[ "$mps" -lt 128 ]] && mps=128
+        PCIE_USABLE=$(( lane * PCIE_CUR_WIDTH * mps / (mps + 24) ))
+    else
+        PCIE_USABLE=0
+    fi
+}
+
+# The required rate is computed by the driver (framesize x fps) and printed
+# in /proc/sc0710-state, so this does not have to re-derive it.
+sc0710_required_bps() {
+    grep -oP '^\s*req bytes/s:\s*\K[0-9]+' /proc/sc0710-state 2>/dev/null | head -1
+}
+
+# The capture fourcc, from the same /proc line as the required rate.
+sc0710_capture_fourcc() {
+    grep -oP '^\s*req bytes/s:.*,\s*\K[A-Za-z0-9]{4}' /proc/sc0710-state 2>/dev/null | head -1
+}
+
+sc0710_state_field() {
+    grep -oP "^\s*$1:\s*\K.*" /proc/sc0710-state 2>/dev/null | head -1
+}
+
+# Produce the verdict block. Written to stdout so it can go both to the
+# top of the dump file and to the terminal.
+# Warn when the loaded module predates this CLI. A stale module is easy to
+# miss: everything loads cleanly, the parameter you passed is logged as
+# "unknown parameter ... ignored" in dmesg and nowhere else, and the output
+# looks normal while silently reflecting the old defaults.
+sc0710_check_module_freshness() {
+    local pdir=/sys/module/sc0710/parameters
+    local name missing=""
+
+    [[ -d "$pdir" ]] || return 0
+    for name in "${SC0710_PERSIST_PARAMS[@]}"; do
+        [[ -e "$pdir/$name" ]] || missing="$missing $name"
+    done
+    [[ -z "$missing" ]] && return 0
+
+    echo "NOTE:          the loaded module is older than this CLI."
+    echo "               Missing parameter(s):$missing"
+    echo "               Rebuild and reload from this source tree, or those"
+    echo "               settings will be silently ignored at load time."
+    echo ""
+}
+
+sc0710_pcie_verdict() {
+    local bdfs bdf req util fmt shorts warn=0 crit=0
+    local -a notes=()
+
+    sc0710_check_module_freshness
+
+    mapfile -t bdfs < <(sc0710_find_bdfs)
+    if [[ ${#bdfs[@]} -eq 0 ]]; then
+        echo "PCIe:          no SC0710 capture card found (vendor 12ab, device 0710/0380)"
+        return
+    fi
+    bdf="${bdfs[0]}"
+    sc0710_pcie_probe "$bdf"
+
+    printf 'Card:          %s\n' "$bdf"
+    printf 'Topology:      %s\n' "${PCIE_PATH:-unknown}"
+    printf 'Link:          %s x%s trained' "$PCIE_CUR_SPEED" "$PCIE_CUR_WIDTH"
+    if [[ "$PCIE_CUR_WIDTH" -gt 0 && "$PCIE_MAX_WIDTH" -gt 0 && "$PCIE_CUR_WIDTH" -lt "$PCIE_MAX_WIDTH" ]]; then
+        printf '  ** DEGRADED (capable of x%s) **\n' "$PCIE_MAX_WIDTH"
+        notes+=("Link trained to x$PCIE_CUR_WIDTH but the card is capable of x$PCIE_MAX_WIDTH.
+    A degraded link starves DMA on its own and looks exactly like a driver
+    bug. Reseat the card, and remove any riser or extension cable.")
+        crit=1
+    else
+        printf ' (max x%s)\n' "$PCIE_MAX_WIDTH"
+    fi
+
+    if [[ "$PCIE_MPS" -gt 0 ]]; then
+        printf 'MaxPayload:    %s bytes\n' "$PCIE_MPS"
+    else
+        printf 'MaxPayload:    unknown (run as root for MPS)\n'
+    fi
+
+    if [[ "$PCIE_USABLE" -gt 0 ]]; then
+        printf 'Usable BW:     ~%s MB/s\n' "$(( PCIE_USABLE / 1000000 ))"
+    fi
+
+    if [[ "$PCIE_UPSTREAM_COUNT" -ge 1 ]]; then
+        printf 'Slot:          behind %s upstream bridge(s) -- SHARED UPLINK\n' "$PCIE_UPSTREAM_COUNT"
+        notes+=("The card is not on CPU-direct lanes: its traffic shares an uplink with
+    whatever else hangs off that bridge (USB, NVMe, networking). At high
+    link utilisation that is enough to truncate a transfer mid-frame.
+    Moving the card to the primary CPU-direct x16 slot is the known fix.")
+        warn=1
+    else
+        printf 'Slot:          CPU-direct (no intermediate bridge)\n'
+    fi
+
+    fmt=$(sc0710_state_field "HDMI")
+    [[ -n "$fmt" ]] && printf 'Signal:        %s\n' "$fmt"
+
+    req=$(sc0710_required_bps)
+    if [[ -n "$req" && "$req" -gt 0 && "$PCIE_USABLE" -gt 0 ]]; then
+        util=$(( req * 100 / PCIE_USABLE ))
+        printf 'Stream needs:  %s MB/s  =  %s%% of usable link bandwidth\n' \
+            "$(( req / 1000000 ))" "$util"
+        if [[ "$util" -ge 85 ]]; then
+            if [[ "$(sc0710_capture_fourcc)" == "YUYV" ]]; then
+                # Already on the cheapest format, so the only remaining
+                # levers are the link itself and the source resolution.
+                notes+=("At ${util}% sustained utilisation there is no headroom left, and the
+    capture is already YUYV (4:2:2) -- there is no cheaper format to fall
+    back to. The link itself has to change: a CPU-direct slot, a wider or
+    faster link, or a lower source resolution or refresh rate.")
+            else
+                notes+=("At ${util}% sustained utilisation there is no headroom left. Corruption
+    here is expected, not a driver fault. The capture is using a packed RGB
+    format; switching it to YUYV (4:2:2) costs a third of the bandwidth for
+    the same picture, and is the cheapest thing to try first.")
+            fi
+            crit=1
+        elif [[ "$util" -ge 65 ]]; then
+            notes+=("${util}% sustained utilisation is high enough that competing PCIe
+    traffic can starve the card intermittently.")
+            warn=1
+        fi
+    elif [[ -z "$req" ]]; then
+        printf 'Stream needs:  unknown (no signal locked, or module not loaded)\n'
+    fi
+
+    shorts=$(grep -oP '^\s*short descr:\s*\K[0-9]+' /proc/sc0710-state 2>/dev/null | head -1)
+    if [[ -n "$shorts" ]]; then
+        printf 'Short descrs:  %s\n' "$shorts"
+        if [[ "$shorts" -gt 0 ]]; then
+            notes+=("The DMA engine completed $shorts descriptor(s) short of their configured
+    length. Each one permanently shifts the frame anchor, which is the
+    'picture moved and never came back' symptom. This confirms starvation
+    rather than a signal or EDID problem.")
+            crit=1
+        fi
+    fi
+
+    echo ""
+    if [[ "$crit" -eq 1 ]]; then
+        echo "VERDICT:       PCIe bandwidth starvation is the likely cause."
+    elif [[ "$warn" -eq 1 ]]; then
+        echo "VERDICT:       Marginal. Starvation is plausible under load."
+    else
+        echo "VERDICT:       PCIe link and bandwidth look healthy."
+        echo "               If the picture still corrupts, it is not starvation --"
+        echo "               capture the dump while it is happening and open an issue."
+    fi
+    if [[ ${#notes[@]} -gt 0 ]]; then
+        echo ""
+        printf '  - %s\n\n' "${notes[@]}"
+    fi
+}
+
+dump_section() {
+    printf '\n=== %s ===\n' "$1" >> "$DUMP_FILE"
+}
+
+dump_cmd() {
+    local label="$1"
+    shift
+    printf '\n--- %s ---\n' "$label" >> "$DUMP_FILE"
+    if command -v "${1%% *}" &>/dev/null || [[ "$1" == cat ]] || [[ "$1" == ls ]]; then
+        "$@" >> "$DUMP_FILE" 2>&1 || printf '(command failed: %s)\n' "$*" >> "$DUMP_FILE"
+    else
+        printf '(not available)\n' >> "$DUMP_FILE"
+    fi
+}
+
+dump_file_if_exists() {
+    local path="$1"
+    if [[ -f "$path" ]]; then
+        printf '\n--- %s ---\n' "$path" >> "$DUMP_FILE"
+        cat "$path" >> "$DUMP_FILE" 2>&1
+    else
+        printf '%s: (not present)\n' "$path" >> "$DUMP_FILE"
+    fi
+}
+
+get_hostname() {
+    local name=""
+    if [[ -f /etc/hostname ]]; then
+        name=$(tr -d '[:space:]' < /etc/hostname)
+    fi
+    if [[ -z "$name" ]]; then
+        name=$(hostname -s 2>/dev/null || hostname 2>/dev/null || uname -n 2>/dev/null || true)
+    fi
+    printf '%s' "${name:-unknown}"
+}
+
+write_debug_dump() {
+    local dump_date dump_stamp
+    dump_date=$(date '+%d-%m-%Y')
+    dump_stamp=$(date '+%Y-%m-%d %H:%M:%S %Z')
+    resolve_dump_desktop
+    DUMP_FILE="${DUMP_DESKTOP}/dump-${dump_date}.txt"
+
+    {
+        printf 'SC0710 Debug Dump\n'
+        printf 'Generated: %s\n' "$dump_stamp"
+        printf 'Collected by: %s\n' "$DUMP_USER"
+    } > "$DUMP_FILE"
+
+    # The verdict goes first: it is the part a reader (or a maintainer
+    # triaging an issue) should see without scrolling through six hundred
+    # lines of lspci output.
+    dump_section "Verdict"
+    sc0710_pcie_verdict >> "$DUMP_FILE" 2>&1
+
+    dump_section "System"
+    {
+        if [[ -f /etc/os-release ]]; then
+            # shellcheck disable=SC1091
+            . /etc/os-release
+            printf 'Linux Distro: %s\n' "${PRETTY_NAME:-$NAME}"
+            printf 'ID: %s\n' "${ID:-unknown}"
+            printf 'Version: %s\n' "${VERSION_ID:-unknown}"
+        else
+            printf 'Linux Distro: unknown\n'
+        fi
+        printf 'Kernel Version: %s\n' "$(uname -r)"
+        printf 'System Type: %s\n' "$(is_steamos && echo SteamOS || { [[ "$IS_ATOMIC" == "true" ]] && echo Atomic || echo Standard; })"
+        printf 'Architecture: %s\n' "$(uname -m)"
+        printf 'Hostname: %s\n' "$(get_hostname)"
+        printf 'Uptime: %s\n' "$(uptime -p 2>/dev/null || uptime 2>/dev/null || echo unknown)"
+        if is_steamos; then
+            printf 'SteamOS Rootfs: %s\n' "$(sc0710_steamos_rootfs_locked && echo 'read-only' || echo writable)"
+            printf 'Persistent Source: %s\n' "$SC0710_STEAMOS_HOME"
+            printf 'Kernel Headers Package: %s\n' "$(sc0710_steamos_headers_pkg)"
+            printf 'Kernel Headers Present: %s\n' "$(sc0710_steamos_have_headers && echo yes || echo no)"
+        elif [[ "$IS_ATOMIC" == "true" ]]; then
+            printf 'Ostree Booted: %s\n' "$([[ -f /run/ostree-booted ]] && echo yes || echo no)"
+            command -v rpm-ostree &>/dev/null && printf 'rpm-ostree: available\n' || printf 'rpm-ostree: not found\n'
+        fi
+    } >> "$DUMP_FILE"
+
+    dump_section "Driver"
+    {
+        printf 'Driver Version: %s\n' "${CURRENT_VERSION:-unknown}"
+        if command -v sc0710-cli &>/dev/null || [[ -f /usr/local/bin/sc0710-cli ]]; then
+            printf 'CLI Installed: yes (%s)\n' "$(command -v sc0710-cli 2>/dev/null || echo /usr/local/bin/sc0710-cli)"
+        else
+            printf 'CLI Installed: no\n'
+        fi
+        if lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+            printf 'Module Loaded: yes\n'
+            lsmod | awk -v m="$DRV_NAME" '$1 == m {printf "Module Size: %s bytes\nModule Reference Count: %s\n", $2, $3}'
+            awk -v m="$DRV_NAME" '$1 == m {print "Used By:", $4}' /proc/modules 2>/dev/null
+        else
+            printf 'Module Loaded: no\n'
+        fi
+        if [[ "$IS_ATOMIC" == "true" ]]; then
+            printf 'Source Directory: %s\n' "$SRC_DIR"
+            dump_file_if_exists "$SRC_DIR/.built-for-kernel"
+        elif [[ -n "$DKMS_SRC" ]]; then
+            printf 'DKMS Source Directory: %s\n' "$DKMS_SRC"
+        else
+            printf 'Installed Source: not found\n'
+        fi
+    } >> "$DUMP_FILE"
+
+    dump_section "Install State"
+    if [[ "$IS_ATOMIC" == "true" ]]; then
+        if is_steamos; then
+            dump_cmd "SteamOS release" bash -c "cat /etc/os-release 2>/dev/null || echo '(no os-release)'"
+            dump_cmd "Rootfs state" bash -c "btrfs property get -ts / ro 2>/dev/null || echo '(not btrfs)'"
+            dump_cmd "Neptune headers" bash -c "pacman -Q \$(uname -r | sed -n 's/.*neptune-\\([0-9]*\\).*/linux-neptune-\\1-headers/p') 2>/dev/null || echo '(headers package not installed)'"
+        else
+            dump_cmd "rpm-ostree status" bash -c "rpm-ostree status 2>/dev/null || echo '(rpm-ostree unavailable)'"
+        fi
+        dump_cmd "Atomic build service" systemctl status sc0710-build.service --no-pager
+        dump_cmd "sc0710-build.service journal (last 50 lines)" bash -c "journalctl -u sc0710-build.service -n 50 --no-pager 2>/dev/null || echo '(no journal entries)'"
+        dump_file_if_exists "$SRC_DIR/.built-for-kernel"
+        dump_file_if_exists "$SRC_DIR/build-and-load.sh"
+        [[ -f "$SRC_DIR/build/${DRV_NAME}.ko" ]] && printf 'Built module: %s (%s bytes)\n' "$SRC_DIR/build/${DRV_NAME}.ko" "$(stat -c %s "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || echo unknown)" >> "$DUMP_FILE" \
+            || printf 'Built module: not found\n' >> "$DUMP_FILE"
+        printf 'Note: /etc/modules-load.d/%s.conf is not used on Atomic distros (module loaded via insmod).\n' "$DRV_NAME" >> "$DUMP_FILE"
+    else
+        dump_cmd "DKMS status" dkms status
+        dump_cmd "DKMS status (sc0710 only)" bash -c "dkms status 2>/dev/null | grep -i sc0710 || echo '(no sc0710 DKMS entries)'"
+        for d in /usr/src/${DRV_NAME}-*; do
+            [[ -d "$d" ]] && printf 'DKMS source present: %s\n' "$d" >> "$DUMP_FILE"
+        done
+        [[ -d "/var/lib/dkms/${DRV_NAME}" ]] && printf 'DKMS lib dir present: /var/lib/dkms/%s\n' "$DRV_NAME" >> "$DUMP_FILE" \
+            || printf 'DKMS lib dir: not present\n' >> "$DUMP_FILE"
+    fi
+    for fw in /var/lib/sc0710/firmware/SC0710.FWI.HEX /etc/firmware/sc0710/SC0710.FWI.HEX /lib/firmware/sc0710/SC0710.FWI.HEX; do
+        [[ -f "$fw" ]] && printf 'Firmware present: %s\n' "$fw" >> "$DUMP_FILE"
+    done
+
+    dump_section "PCI Devices"
+    dump_cmd "lspci (SC0710 / Magewell / Elgato related)" bash -c "lspci -nn 2>/dev/null | grep -iE '12ab:0710|12ab:0380|1cfa:|magewell|sc0710' || echo '(no matching PCI devices)'"
+    dump_cmd "lspci -nn (full)" lspci -nn
+    dump_cmd "lspci -nnv (SC0710 device)" bash -c "lspci -nnv -d 12ab:0710 2>/dev/null; lspci -nnv -d 12ab:0380 2>/dev/null"
+
+    # Link state for the card and for every bridge between it and the root
+    # complex: a link that trained below its capability anywhere on that
+    # path starves DMA the same way a shared uplink does.
+    printf '\n--- PCIe link state (card and upstream path) ---\n' >> "$DUMP_FILE"
+    {
+        for bdf in $(sc0710_find_bdfs); do
+            for node in $(sc0710_pcie_path "$bdf" | sed 's/->/ /g'); do
+                printf '%s: %s x%s (max %s x%s) %s\n' "$node" \
+                    "$(cat "/sys/bus/pci/devices/$node/current_link_speed" 2>/dev/null || echo '?')" \
+                    "$(cat "/sys/bus/pci/devices/$node/current_link_width" 2>/dev/null || echo '?')" \
+                    "$(cat "/sys/bus/pci/devices/$node/max_link_speed" 2>/dev/null || echo '?')" \
+                    "$(cat "/sys/bus/pci/devices/$node/max_link_width" 2>/dev/null || echo '?')" \
+                    "$(lspci -s "$node" 2>/dev/null | cut -d' ' -f2- | cut -c1-60)"
+            done
+        done
+    } >> "$DUMP_FILE" 2>&1
+    dump_cmd "PCIe AER / error counters" bash -c "lspci -vvv -d 12ab: 2>/dev/null | grep -iE 'UESta|CESta|LnkSta|DevSta|MaxPayload' || echo '(needs root)'"
+
+    dump_section "Video Devices"
+    dump_cmd "Video device nodes" bash -c "ls -la /dev/video* 2>/dev/null || echo '(no /dev/video* nodes)'"
+    dump_cmd "v4l2 device list" bash -c "v4l2-ctl --list-devices 2>/dev/null || echo '(v4l2-ctl not installed)'"
+    dump_cmd "v4l2loopback module" bash -c "lsmod | grep -E '^v4l2loopback|Module' || echo '(v4l2loopback not loaded)'"
+    if lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+        dump_cmd "Driver-bound PCI devices" bash -c "ls -d /sys/bus/pci/drivers/${DRV_NAME}/0* 2>/dev/null | while read -r p; do echo \"\$(basename \"\$p\")\"; done || echo '(none bound)'"
+    fi
+
+    dump_section "Device Usage"
+    dump_cmd "Processes using video devices (fuser)" bash -c "fuser -v /dev/video* 2>&1 || echo '(none or fuser unavailable)'"
+    dump_cmd "Processes using video devices (lsof)" bash -c "lsof /dev/video* 2>/dev/null || echo '(none or lsof unavailable)'"
+    dump_cmd "Processes using audio devices (fuser)" bash -c "fuser -v /dev/snd/* 2>&1 || echo '(none or fuser unavailable)'"
+
+    dump_section "Configuration"
+    dump_file_if_exists "/etc/modules-load.d/${DRV_NAME}.conf"
+    dump_file_if_exists "/etc/modprobe.d/${DRV_NAME}.conf"
+    dump_file_if_exists "/etc/modprobe.d/${DRV_NAME}-atomic.conf"
+    dump_file_if_exists "/etc/modprobe.d/${DRV_NAME}-params.conf"
+    dump_file_if_exists "/etc/systemd/system/sc0710-build.service"
+    dump_file_if_exists "/etc/systemd/system/sc0710-firmware.service"
+    if [[ "$DUMP_USER" != "root" ]]; then
+        printf '\n--- User groups (%s) ---\n' "$DUMP_USER" >> "$DUMP_FILE"
+        groups "$DUMP_USER" >> "$DUMP_FILE" 2>&1 || true
+    fi
+
+    dump_section "Module Details"
+    if lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+        if modinfo "$DRV_NAME" &>/dev/null; then
+            dump_cmd "modinfo" modinfo "$DRV_NAME"
+        elif [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/build/${DRV_NAME}.ko" ]]; then
+            dump_cmd "modinfo (built module)" modinfo "$SRC_DIR/build/${DRV_NAME}.ko"
+        fi
+        dump_cmd "Module parameters" bash -c "ls -la /sys/module/${DRV_NAME}/parameters/ 2>/dev/null && for p in /sys/module/${DRV_NAME}/parameters/*; do printf '%s=%s\n' \"\$(basename \"\$p\")\" \"\$(cat \"\$p\" 2>/dev/null)\"; done"
+        dump_file_if_exists "/proc/sc0710-state"
+    else
+        printf 'Module not loaded — skipping live parameters.\n' >> "$DUMP_FILE"
+        if [[ "$IS_ATOMIC" == "true" && -f "$SRC_DIR/build/${DRV_NAME}.ko" ]]; then
+            dump_cmd "modinfo (built module)" modinfo "$SRC_DIR/build/${DRV_NAME}.ko"
+        else
+            dump_cmd "modinfo (if module file exists)" bash -c "modinfo ${DRV_NAME} 2>/dev/null || echo '(module not available in kernel tree)'"
+        fi
+    fi
+
+    dump_section "PipeWire / Audio Stack"
+    dump_cmd "PipeWire processes" bash -c "pgrep -a pipewire 2>/dev/null || echo '(pipewire not running)'"
+    if [[ "$DUMP_USER" != "root" ]]; then
+        uid=$(id -u "$DUMP_USER" 2>/dev/null || echo "")
+        if [[ -n "$uid" ]]; then
+            dump_cmd "PipeWire user services ($DUMP_USER)" bash -c "sudo -u '#$uid' XDG_RUNTIME_DIR='/run/user/$uid' systemctl --user status pipewire.socket pipewire.service wireplumber.service --no-pager 2>&1"
+        fi
+    fi
+
+    dump_section "Kernel Log (sc0710)"
+    dump_cmd "dmesg (sc0710, last 150 lines)" bash -c "dmesg 2>/dev/null | grep -i sc0710 | tail -150 || echo '(no sc0710 messages in dmesg)'"
+    dump_cmd "dmesg (v4l2loopback)" bash -c "dmesg 2>/dev/null | grep -i v4l2loopback | tail -50 || echo '(no v4l2loopback messages)'"
+
+    dump_section "Install Logs"
+    if [[ -d /var/log/sc0710 ]]; then
+        dump_cmd "Install log directory listing" ls -la /var/log/sc0710
+        for log in /var/log/sc0710/*; do
+            [[ -f "$log" ]] && dump_cmd "$(basename "$log") (last 80 lines)" bash -c "tail -80 '$log'"
+        done
+    else
+        printf '/var/log/sc0710: (not present)\n' >> "$DUMP_FILE"
+    fi
+
+    if [[ "$DUMP_USER" != "root" ]]; then
+        chown "$DUMP_USER:$DUMP_USER" "$DUMP_FILE" 2>/dev/null || true
+    fi
+    chmod 0644 "$DUMP_FILE" 2>/dev/null || true
+
+    echo -e "${GREEN}[OK]${NC} Debug dump written to ${BOLD}${DUMP_FILE}${NC}"
+    echo -e "${BLUE}[INFO]${NC} Attach this file when reporting issues on GitHub."
+}
+
+# --- HDR snapshot self-test (Desktop/HDR/) ---
+
+sc0710_find_video_dev() {
+    local n name
+    for n in /sys/class/video4linux/video*; do
+        [[ -f "$n/name" ]] || continue
+        name=$(tr -d '\0' < "$n/name" 2>/dev/null || true)
+        if [[ "$name" == *sc0710* ]]; then
+            printf '%s\n' "/dev/$(basename "$n")"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Stop PipeWire so we can open the capture node exclusively.
+# Sets SC0710_HDR_TEST_PW_UIDS for later restart.
+sc0710_hdr_test_stop_pipewire() {
+    local uid pid
+    SC0710_HDR_TEST_PW_UIDS=()
+    while read -r pid; do
+        uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
+        SC0710_HDR_TEST_PW_UIDS+=("$uid")
+    done < <(pgrep -x pipewire 2>/dev/null || true)
+    for uid in $(printf '%s\n' "${SC0710_HDR_TEST_PW_UIDS[@]}" | sort -u); do
+        sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            systemctl --user stop pipewire.socket pipewire-pulse.socket \
+                pipewire.service pipewire-pulse.service wireplumber.service 2>/dev/null || true
+    done
+    sleep 0.5
+}
+
+sc0710_hdr_test_start_pipewire() {
+    local uid
+    for uid in $(printf '%s\n' "${SC0710_HDR_TEST_PW_UIDS[@]:-}" | sort -u); do
+        [[ -n "$uid" ]] || continue
+        sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+            systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null || true
+    done
+    SC0710_HDR_TEST_PW_UIDS=()
+}
+
+# Apply module params + V4L2 FourCC for one HDR-test cell.
+# $1 force_eotf  $2 hdr_bgr24  $3 sw_tonemap  $4 fourcc (YUYV|BGR3)  $5 video
+# optional $6 hw_tonemap (default 0 when omitted)
+sc0710_hdr_test_apply() {
+    local fe="$1" bgr="$2" tm="$3" fourcc="$4" video="$5"
+    local hw="${6:-0}"
+    local wh w h
+
+    echo "$fe" > /sys/module/sc0710/parameters/force_eotf
+    echo "$bgr" > /sys/module/sc0710/parameters/hdr_bgr24
+    if [[ -f /sys/module/sc0710/parameters/hw_tonemap ]]; then
+        echo "$hw" > /sys/module/sc0710/parameters/hw_tonemap
+    fi
+    echo "$tm" > /sys/module/sc0710/parameters/sw_tonemap
+    # Give sync_hdr_deliver a beat (format may resize while idle).
+    sleep 1.2
+
+    wh=$(v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null \
+        | awk -F: '/Width\/Height/{gsub(/ /,"",$2); print $2; exit}')
+    w=${wh%%/*}
+    h=${wh##*/}
+    if [[ ! "$w" =~ ^[0-9]+$ || ! "$h" =~ ^[0-9]+$ ]]; then
+        wh=$(grep -oE '[0-9]+x[0-9]+' /proc/sc0710-state 2>/dev/null | head -1)
+        w=${wh%%x*}
+        h=${wh##*x}
+    fi
+    if [[ ! "$w" =~ ^[0-9]+$ || ! "$h" =~ ^[0-9]+$ ]]; then
+        w=1920
+        h=1080
+    fi
+
+    # Explicit FourCC so tonemap+BGR24 and baseline cells are comparable.
+    v4l2-ctl -d "$video" --set-fmt-video="width=${w},height=${h},pixelformat=${fourcc}" >/dev/null 2>&1 || true
+    sleep 0.4
+}
+
+# Grab one still from $1 into PNG $2 (YUYV or BGR24).
+sc0710_hdr_test_capture() {
+    local dev="$1" out="$2"
+    local fmt wh w h pix_fmt bpp frame_bytes raw tmpdir err fmt_info
+
+    if ! command -v v4l2-ctl >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} v4l2-ctl is required for --hdr-test (pacman: v4l-utils)."
+        return 1
+    fi
+
+    fmt_info=$(v4l2-ctl -d "$dev" --get-fmt-video 2>/dev/null) || {
+        echo -e "${RED}[ERROR]${NC} Cannot query format on $dev"
+        return 1
+    }
+    fmt=$(printf '%s\n' "$fmt_info" | awk -F"'" '/Pixel Format/{print $2; exit}')
+    wh=$(printf '%s\n' "$fmt_info" | awk -F: '/Width\/Height/{gsub(/ /,"",$2); print $2; exit}')
+    w=${wh%%/*}
+    h=${wh##*/}
+    if [[ ! "$w" =~ ^[0-9]+$ || ! "$h" =~ ^[0-9]+$ || "$w" -lt 2 || "$h" -lt 2 ]]; then
+        wh=$(grep -oE '[0-9]+x[0-9]+' /proc/sc0710-state 2>/dev/null | head -1)
+        w=${wh%%x*}
+        h=${wh##*x}
+    fi
+    if [[ ! "$w" =~ ^[0-9]+$ || ! "$h" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}[ERROR]${NC} Could not determine capture resolution."
+        return 1
+    fi
+
+    case "$fmt" in
+        BGR3|BGR24|RGB3)
+            pix_fmt=bgr24
+            bpp=3
+            ;;
+        YUYV|YUYV*)
+            pix_fmt=yuyv422
+            bpp=2
+            ;;
+        *)
+            if [[ "$(cat /sys/module/sc0710/parameters/hdr_bgr24 2>/dev/null)" == "1" ]] &&
+               [[ "$(cat /sys/module/sc0710/parameters/sw_tonemap 2>/dev/null)" == "0" ]]; then
+                pix_fmt=bgr24
+                bpp=3
+                fmt=BGR3
+            else
+                pix_fmt=yuyv422
+                bpp=2
+                fmt=YUYV
+            fi
+            ;;
+    esac
+    frame_bytes=$((w * h * bpp))
+
+    tmpdir=$(mktemp -d /tmp/sc0710-hdr-XXXXXX) || return 1
+    raw="${tmpdir}/frame.raw"
+
+    err=$(v4l2-ctl -d "$dev" \
+        --stream-mmap=4 \
+        --stream-skip=8 \
+        --stream-count=1 \
+        --stream-to="$raw" 2>&1) || {
+        echo -e "${RED}[ERROR]${NC} v4l2 stream failed: ${err:-unknown}"
+        rm -rf "$tmpdir"
+        return 1
+    }
+
+    if [[ ! -s "$raw" ]]; then
+        echo -e "${RED}[ERROR]${NC} Empty raw capture from $dev ($fmt ${w}x${h})"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    if [[ $(stat -c%s "$raw") -gt $frame_bytes ]]; then
+        tail -c "$frame_bytes" "$raw" > "${raw}.one" && mv "${raw}.one" "$raw"
+    fi
+
+    err=$(ffmpeg -hide_banner -loglevel error -y \
+        -f rawvideo -pix_fmt "$pix_fmt" -s:v "${w}x${h}" -i "$raw" \
+        -frames:v 1 "$out" 2>&1) || {
+        echo -e "${RED}[ERROR]${NC} Convert failed ($fmt ${w}x${h} → PNG): ${err:-ffmpeg error}"
+        rm -rf "$tmpdir"
+        return 1
+    }
+    rm -rf "$tmpdir"
+
+    [[ -s "$out" ]] || { echo -e "${RED}[ERROR]${NC} Empty snapshot: $out"; return 1; }
+    return 0
+}
+
+# Cycle HDR configs; save PNGs + summary to Desktop/HDR/.
+# Slot 00 is a forced-SDR baseline (no HDR processing) for side-by-side reference.
+sc0710_hdr_self_test() {
+    local stamp outdir video orig_fe orig_bgr orig_tm orig_fmt
+    local mode_slug mode_label fe bgr tm fourcc out meta rc=0
+
+    if ! lsmod | grep -q "^${DRV_NAME} "; then
+        echo -e "${RED}[ERROR]${NC} Module not loaded. Run: sc0710-cli --load"
+        return 1
+    fi
+    if [[ ! -f /sys/module/sc0710/parameters/hdr_bgr24 ]] ||
+       [[ ! -f /sys/module/sc0710/parameters/sw_tonemap ]] ||
+       [[ ! -f /sys/module/sc0710/parameters/force_eotf ]]; then
+        echo -e "${RED}[ERROR]${NC} HDR params missing — rebuild/reload the driver first."
+        return 1
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} ffmpeg is required for --hdr-test."
+        return 1
+    fi
+    if ! command -v v4l2-ctl >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} v4l2-ctl is required for --hdr-test (pacman: v4l-utils)."
+        return 1
+    fi
+
+    video=$(sc0710_find_video_dev) || {
+        echo -e "${RED}[ERROR]${NC} No sc0710 video device found."
+        return 1
+    }
+
+    resolve_dump_desktop
+    outdir="${DUMP_DESKTOP}/HDR"
+    mkdir -p "$outdir"
+    stamp=$(date '+%Y%m%d_%H%M%S')
+    meta="${outdir}/hdr-test_${stamp}_summary.txt"
+
+    orig_fe=$(cat /sys/module/sc0710/parameters/force_eotf)
+    orig_bgr=$(cat /sys/module/sc0710/parameters/hdr_bgr24)
+    orig_tm=$(cat /sys/module/sc0710/parameters/sw_tonemap)
+    orig_fmt=$(v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null \
+        | awk -F"'" '/Pixel Format/{print $2; exit}')
+    [[ -z "$orig_fmt" ]] && orig_fmt=YUYV
+
+    cleanup_hdr_test() {
+        echo "$orig_fe" > /sys/module/sc0710/parameters/force_eotf 2>/dev/null || true
+        echo "$orig_bgr" > /sys/module/sc0710/parameters/hdr_bgr24 2>/dev/null || true
+        echo "$orig_tm" > /sys/module/sc0710/parameters/sw_tonemap 2>/dev/null || true
+        v4l2-ctl -d "$video" --set-fmt-video="pixelformat=${orig_fmt}" >/dev/null 2>&1 || true
+        sc0710_hdr_test_start_pipewire
+    }
+    trap cleanup_hdr_test EXIT
+
+    echo -e "${BLUE}::${NC} HDR self-test → ${BOLD}${outdir}${NC}"
+    echo -e "   Device: ${BOLD}${video}${NC}"
+    echo -e "   ${YELLOW}Tip:${NC} slot ${BOLD}00${NC} is forced-SDR baseline (no HDR processing)."
+    echo -e "   For a true no-HDR picture, feed an SDR source during 00, or drop your own"
+    echo -e "   baseline PNG into this folder named like ${BOLD}00-baseline-*.png${NC}."
+    echo -e "   Restoring after test: force_eotf=${orig_fe} hdr_bgr24=${orig_bgr} sw_tonemap=${orig_tm} fmt=${orig_fmt}"
+    {
+        echo "sc0710 HDR self-test"
+        echo "timestamp: $(date -Iseconds)"
+        echo "device: $video"
+        echo "driver: $(cat /sys/module/sc0710/version 2>/dev/null || echo unknown)"
+        echo "hdmi (at start):"
+        grep -E 'HDMI|colorimetry|colorspace|eotf|color_deep|deliver' /proc/sc0710-state 2>/dev/null || true
+        echo ""
+        echo "columns: slug | force_eotf | hdr_bgr24 | sw_tonemap | fourcc"
+        echo ""
+    } > "$meta"
+
+    echo -e "${BLUE}::${NC} Stopping PipeWire for exclusive capture..."
+    sc0710_hdr_test_stop_pipewire
+    fuser -k "$video" >/dev/null 2>&1 || true
+    sleep 0.5
+
+    # slug|label|force_eotf|hdr_bgr24|sw_tonemap|fourcc
+    # Keep ≤12 cells. 00 = no-HDR reference (forced SDR).
+    while IFS='|' read -r mode_slug mode_label fe bgr tm fourcc; do
+        [[ -z "$mode_slug" || "$mode_slug" == \#* ]] && continue
+        echo -e "${BLUE}::${NC} ${BOLD}${mode_slug}${NC} — ${mode_label}"
+        echo -e "   force_eotf=${fe} hdr_bgr24=${bgr} sw_tonemap=${tm} fmt=${fourcc}"
+        sc0710_hdr_test_apply "$fe" "$bgr" "$tm" "$fourcc" "$video"
+
+        out="${outdir}/hdr-test_${stamp}_${mode_slug}.png"
+        if sc0710_hdr_test_capture "$video" "$out"; then
+            echo -e "   ${GREEN}[OK]${NC} Saved $(basename "$out")"
+            {
+                echo "=== ${mode_slug} — ${mode_label} ==="
+                echo "file: $(basename "$out")"
+                echo "force_eotf=$fe hdr_bgr24=$bgr sw_tonemap=$tm fourcc=$fourcc"
+                v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null || true
+                grep -E 'HDMI|eotf|color_deep|deliver|colorimetry|colorspace' /proc/sc0710-state 2>/dev/null || true
+                echo ""
+            } >> "$meta"
+        else
+            echo -e "   ${RED}[FAIL]${NC} ${mode_label}"
+            echo "=== ${mode_slug} — ${mode_label} FAILED ===" >> "$meta"
+            rc=1
+        fi
+    done <<'EOF'
+00-baseline-no-hdr|Baseline forced-SDR YUYV (no HDR processing)|1|0|0|YUYV
+01-baseline-bgr-sdr|Baseline forced-SDR BGR24|1|0|0|BGR3
+02-hdr-yuyv-raw|HDR auto · YUYV · raw (no tonemap)|0|0|0|YUYV
+03-hdr-yuyv-tm|HDR auto · YUYV · tonemap|0|0|1|YUYV
+04-hdr-bgr-passthru|HDR auto · BGR24 passthrough prefer|0|1|0|BGR3
+05-hdr-bgr-tm|HDR auto · BGR24 · tonemap|0|0|1|BGR3
+06-force-pq-yuyv-raw|Force PQ · YUYV · raw|2|0|0|YUYV
+07-force-pq-yuyv-tm|Force PQ · YUYV · tonemap|2|0|1|YUYV
+08-force-pq-bgr-raw|Force PQ · BGR24 · raw|2|1|0|BGR3
+09-force-pq-bgr-tm|Force PQ · BGR24 · tonemap|2|0|1|BGR3
+10-preset-passthru|Preset: HDR passthrough|0|1|0|BGR3
+11-preset-tonemap|Preset: tonemap preview|0|0|1|YUYV
+EOF
+
+    trap - EXIT
+    cleanup_hdr_test
+
+    if [[ "$DUMP_USER" != "root" ]]; then
+        chown -R "$DUMP_USER:" "$outdir" 2>/dev/null || true
+    fi
+
+    echo ""
+    if [[ "$rc" -eq 0 ]]; then
+        echo -e "${GREEN}[OK]${NC} HDR self-test complete → ${BOLD}${outdir}${NC}"
+    else
+        echo -e "${YELLOW}[WARN]${NC} HDR self-test finished with failures → ${BOLD}${outdir}${NC}"
+    fi
+    echo -e "   Summary: ${BOLD}$(basename "$meta")${NC}"
+    return "$rc"
+}
+
+# MCU enable A/B: HW-only vs SW vs raw × YUYV/BGR24 → Desktop/HDR/hw-ab_<stamp>/
+# Collects PNGs + per-cell dmesg + /proc/sc0710-state (see docs/hdr_hardware.md).
+sc0710_hdr_hw_ab_test() {
+    local stamp outdir video orig_fe orig_bgr orig_tm orig_hw orig_fmt
+    local mode_slug mode_label fe bgr tm hw fourcc out meta dmesg_file state_file rc=0
+
+    if ! lsmod | grep -q "^${DRV_NAME} "; then
+        echo -e "${RED}[ERROR]${NC} Module not loaded. Run: sc0710-cli --load"
+        return 1
+    fi
+    if [[ ! -f /sys/module/sc0710/parameters/hw_tonemap ]] ||
+       [[ ! -f /sys/module/sc0710/parameters/sw_tonemap ]] ||
+       [[ ! -f /sys/module/sc0710/parameters/hdr_bgr24 ]]; then
+        echo -e "${RED}[ERROR]${NC} hw_tonemap/sw_tonemap missing — rebuild/reload first."
+        return 1
+    fi
+    if ! command -v ffmpeg >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} ffmpeg is required."
+        return 1
+    fi
+    if ! command -v v4l2-ctl >/dev/null 2>&1; then
+        echo -e "${RED}[ERROR]${NC} v4l2-ctl is required (pacman: v4l-utils)."
+        return 1
+    fi
+
+    video=$(sc0710_find_video_dev) || {
+        echo -e "${RED}[ERROR]${NC} No sc0710 video device found."
+        return 1
+    }
+
+    resolve_dump_desktop
+    stamp=$(date '+%Y%m%d_%H%M%S')
+    outdir="${DUMP_DESKTOP}/HDR/hw-ab_${stamp}"
+    mkdir -p "$outdir"
+    meta="${outdir}/SUMMARY.txt"
+
+    orig_fe=$(cat /sys/module/sc0710/parameters/force_eotf)
+    orig_bgr=$(cat /sys/module/sc0710/parameters/hdr_bgr24)
+    orig_tm=$(cat /sys/module/sc0710/parameters/sw_tonemap)
+    orig_hw=$(cat /sys/module/sc0710/parameters/hw_tonemap)
+    orig_fmt=$(v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null \
+        | awk -F"'" '/Pixel Format/{print $2; exit}')
+    [[ -z "$orig_fmt" ]] && orig_fmt=YUYV
+
+    cleanup_hdr_hw_ab() {
+        echo "$orig_fe" > /sys/module/sc0710/parameters/force_eotf 2>/dev/null || true
+        echo "$orig_bgr" > /sys/module/sc0710/parameters/hdr_bgr24 2>/dev/null || true
+        echo "$orig_hw" > /sys/module/sc0710/parameters/hw_tonemap 2>/dev/null || true
+        echo "$orig_tm" > /sys/module/sc0710/parameters/sw_tonemap 2>/dev/null || true
+        v4l2-ctl -d "$video" --set-fmt-video="pixelformat=${orig_fmt}" >/dev/null 2>&1 || true
+        sc0710_hdr_test_start_pipewire
+    }
+    trap cleanup_hdr_hw_ab EXIT
+
+    echo -e "${BLUE}::${NC} MCU HW A/B test → ${BOLD}${outdir}${NC}"
+    echo -e "   Device: ${BOLD}${video}${NC}"
+    echo -e "   Feed an ${BOLD}HDR-PQ${NC} source the whole run."
+    echo -e "   Cells: A=HW-only (0x11)  B=SW tonemap  C=raw (both off)  × YUYV + BGR24"
+    {
+        echo "sc0710 MCU hardware tonemap A/B"
+        echo "timestamp: $(date -Iseconds)"
+        echo "device: $video"
+        echo "driver: $(cat /sys/module/sc0710/version 2>/dev/null || echo unknown)"
+        echo "outdir: $outdir"
+        echo ""
+        echo "Compare PNGs:"
+        echo "  A vs C — does MCU 0x11 remapping happen?"
+        echo "  A vs B — HW baked look vs tuned software"
+        echo ""
+        echo "hdmi (at start):"
+        cat /proc/sc0710-state 2>/dev/null || true
+        echo ""
+        echo "===== dmesg (start, last 40 sc0710 lines) ====="
+        dmesg -T 2>/dev/null | grep -iE 'sc0710|hw_tonemap|HDR pipe' | tail -40 || true
+        echo ""
+    } > "$meta"
+
+    echo -e "${BLUE}::${NC} Stopping PipeWire for exclusive capture..."
+    sc0710_hdr_test_stop_pipewire
+    fuser -k "$video" >/dev/null 2>&1 || true
+    sleep 0.5
+
+    # slug|label|force_eotf|hdr_bgr24|sw_tonemap|hw_tonemap|fourcc
+    while IFS='|' read -r mode_slug mode_label fe bgr tm hw fourcc; do
+        [[ -z "$mode_slug" || "$mode_slug" == \#* ]] && continue
+        echo -e "${BLUE}::${NC} ${BOLD}${mode_slug}${NC} — ${mode_label}"
+        echo -e "   force_eotf=${fe} hdr_bgr24=${bgr} sw=${tm} hw=${hw} fmt=${fourcc}"
+        sc0710_hdr_test_apply "$fe" "$bgr" "$tm" "$fourcc" "$video" "$hw"
+
+        out="${outdir}/${mode_slug}.png"
+        dmesg_file="${outdir}/${mode_slug}.dmesg.txt"
+        state_file="${outdir}/${mode_slug}.state.txt"
+
+        {
+            echo "=== ${mode_slug} — ${mode_label} ==="
+            echo "params: force_eotf=$fe hdr_bgr24=$bgr sw_tonemap=$tm hw_tonemap=$hw fourcc=$fourcc"
+            echo "sysfs: hw=$(cat /sys/module/sc0710/parameters/hw_tonemap) sw=$(cat /sys/module/sc0710/parameters/sw_tonemap)"
+            echo ""
+            echo "----- /proc/sc0710-state -----"
+            cat /proc/sc0710-state 2>/dev/null || true
+            echo ""
+            echo "----- dmesg (hw_tonemap / HDR pipe / recent sc0710) -----"
+            dmesg -T 2>/dev/null | grep -iE 'hw_tonemap|HDR pipe|sc0710' | tail -50 || true
+        } > "$dmesg_file"
+        cp "$dmesg_file" "$state_file" 2>/dev/null || true
+
+        if sc0710_hdr_test_capture "$video" "$out"; then
+            echo -e "   ${GREEN}[OK]${NC} $(basename "$out")"
+            {
+                echo "=== ${mode_slug} — ${mode_label} ==="
+                echo "file: $(basename "$out")"
+                echo "force_eotf=$fe hdr_bgr24=$bgr sw_tonemap=$tm hw_tonemap=$hw fourcc=$fourcc"
+                v4l2-ctl -d "$video" --get-fmt-video 2>/dev/null || true
+                grep -E 'HDMI|eotf|color_deep|deliver|mode=|hw.tonemap|tonemap' /proc/sc0710-state 2>/dev/null || true
+                echo "dmesg_hw:"
+                dmesg 2>/dev/null | grep -E 'hw_tonemap MCU' | tail -3 || true
+                echo ""
+            } >> "$meta"
+        else
+            echo -e "   ${RED}[FAIL]${NC} ${mode_label}"
+            echo "=== ${mode_slug} — ${mode_label} FAILED ===" >> "$meta"
+            cat "$dmesg_file" >> "$meta"
+            rc=1
+        fi
+    done <<'EOF'
+A-hw-yuyv|A HW-only · YUYV (MCU 0x11, no SW)|0|0|0|2|YUYV
+A-hw-bgr|A HW-only · BGR24 (MCU 0x11, no SW)|0|0|0|2|BGR3
+B-sw-yuyv|B SW tonemap · YUYV (no MCU)|0|0|1|0|YUYV
+B-sw-bgr|B SW tonemap · BGR24 (no MCU)|0|0|1|0|BGR3
+C-raw-yuyv|C raw · YUYV (HW+SW off)|0|0|0|0|YUYV
+C-raw-bgr|C raw · BGR24 (HW+SW off)|0|0|0|0|BGR3
+EOF
+
+    {
+        echo ""
+        echo "===== dmesg (end, last 60 sc0710 lines) ====="
+        dmesg -T 2>/dev/null | grep -iE 'sc0710|hw_tonemap|HDR pipe' | tail -60 || true
+    } >> "$meta"
+
+    trap - EXIT
+    cleanup_hdr_hw_ab
+
+    if [[ "$DUMP_USER" != "root" ]]; then
+        chown -R "$DUMP_USER:" "$outdir" 2>/dev/null || true
+    fi
+
+    echo ""
+    if [[ "$rc" -eq 0 ]]; then
+        echo -e "${GREEN}[OK]${NC} HW A/B complete → ${BOLD}${outdir}${NC}"
+    else
+        echo -e "${YELLOW}[WARN]${NC} HW A/B finished with failures → ${BOLD}${outdir}${NC}"
+    fi
+    echo -e "   Open ${BOLD}SUMMARY.txt${NC} + the six PNGs. Tell me A vs C and A vs B per format."
+    return "$rc"
+}
+
+# --- Help Function ---
+show_help() {
+    if [[ "$IS_ATOMIC" == "true" ]]; then
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility v${CURRENT_VERSION}$(sc0710_edition_label)"
+    else
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility v${CURRENT_VERSION}"
+    fi
+    echo ""
+    echo -e "${BOLD}USAGE:${NC}"
+    echo -e "    sc0710-cli [OPTION]"
+    echo ""
+    echo -e "${BOLD}OPTIONS:${NC}"
+    echo -e "    ${BOLD}-l, --load${NC}       Load the driver module"
+    echo -e "    ${BOLD}-u, --unload${NC}     Unload the driver module"
+    echo -e "    ${BOLD}--restart${NC}        Restart the driver module"
+    echo -e "    ${BOLD}-s, --status${NC}     Show module and build status"
+    echo -e "    ${BOLD}-d, --debug${NC}      Toggle debug mode on/off"
+    echo -e "    ${BOLD}-it, --image-toggle${NC} Toggle status images on/off"
+    echo -e "    ${BOLD}-pt, --procedural-timings${NC} Toggle timing calculation mode (merge/procedural/static)"
+    echo -e "    ${BOLD}-kaa, --keep-audio-alive${NC} Toggle always-on audio capture (off by default; for mixers)"
+    echo -e "    ${BOLD}-ec, --edid-config${NC} Open the EDID configuration GUI (4K Pro / MK.2)"
+    echo -e "    ${BOLD}-hc, --hdr-config${NC}  Open the HDR / color-depth settings GUI"
+    echo -e "    ${BOLD}-g, --gui${NC}         Open the driver manager GUI (load/unload/tools)"
+    echo -e "    ${BOLD}-ht, --hdr-toggle${NC} Cycle: tonemap preview ↔ HDR passthrough ↔ SDR-only"
+    echo -e "    ${BOLD}--hdr-test${NC}       Snapshot ~12 HDR configs to Desktop/HDR/ (incl. no-HDR baseline)"
+    echo -e "    ${BOLD}--hdr-hw-test${NC}    MCU A/B: HW vs SW vs raw × YUYV/BGR24 + dmesg → Desktop/HDR/hw-ab_*/"
+    echo -e "    ${BOLD}-U, --update${NC}     Check for updates and reinstall"
+    echo -e "    ${BOLD}-r, -R, --remove${NC} Completely uninstall driver and CLI (AUR: uses yay/paru)"
+    echo -e "    ${BOLD}--dump${NC}           Save a debug report to the Desktop"
+    echo -e "    ${BOLD}--verdict${NC}        Analyse the PCIe link and diagnose image corruption"
+    echo -e "    ${BOLD}--rate-decode N${NC}  Reload with refresh-rate decoding N (0=legacy, 1=rate, 2=period)"
+    if [[ "$IS_ATOMIC" == "true" ]]; then
+        echo -e "    ${BOLD}--rebuild${NC}        Force rebuild the module for current kernel"
+    fi
+    echo -e "    ${BOLD}-v, --version${NC}    Show version information"
+    echo -e "    ${BOLD}-h, --help${NC}       Show this help message"
+    if is_steamos; then
+        echo ""
+        echo -e "  ${BOLD}SteamOS notes${NC}"
+        echo -e "    The driver source lives in ${BOLD}${SC0710_STEAMOS_HOME}${NC} — /home is the only"
+        echo -e "    partition a SteamOS update leaves alone. ${BOLD}sc0710-build.service${NC} rebuilds"
+        echo -e "    the module and reinstalls the kernel headers on the first boot after one."
+        echo -e "    These commands unlock the read-only rootfs and re-lock it when they finish."
+        echo -e "    If an update removes the boot service: ${BOLD}sudo bash ${SC0710_STEAMOS_HOME}/steamos-restore.sh${NC}"
+    fi
+    echo ""
+}
+
+# --- No Arguments Handler ---
+if [[ $# -eq 0 ]]; then
+    if [[ "$IS_ATOMIC" == "true" ]]; then
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility$(sc0710_edition_label)"
+    else
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility"
+    fi
+    echo -e "Use ${BOLD}-h${NC} or ${BOLD}--help${NC} for usage information."
+    exit 0
+fi
+
+# --- Command Handler ---
+# SteamOS: these commands write to /etc, /usr/local or /lib/modules, all on the
+# read-only rootfs. Unlock once here; the trap in steamos_rw re-locks on exit.
+case "$1" in
+    -l|--load|-u|--unload|--restart|-d|--debug|-ht|--hdr-toggle|-it|--image-toggle| \
+    -kaa|--keep-audio-alive|-pt|--procedural-timings|-U|--update|--rebuild|-r|-R|--remove| \
+    --rate-decode)
+        steamos_rw || exit 1
+        ;;
+esac
+
+case "$1" in
+    -l|--load)
+        if lsmod | grep -q "$DRV_NAME"; then
+            if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                echo -e "${BLUE}::${NC} Driver loaded — verifying ECP5 FPGA..."
+                if sc0710_cli_ensure_ecp5 3; then
+                    echo -e "${GREEN}[OK]${NC} Driver loaded and ECP5 FPGA programmed."
+                else
+                    echo -e "${RED}[ERROR]${NC} ECP5 programming failed."
+                    echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                    exit 1
+                fi
+            else
+                echo -e "${GREEN}[OK]${NC} Driver is already loaded."
+            fi
+            exit 0
+        fi
+        echo -e "${BLUE}::${NC} Loading driver..."
+        if [[ "$IS_ATOMIC" == "true" ]]; then
+            if sc0710_cli_atomic_load; then
+                if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                    # shellcheck source=/dev/null
+                    SC0710_FW_LOG_FILE="/var/log/sc0710/load_$(date '+%Y%m%d_%H%M%S').log" source "$(sc0710_firmware_lib_path)"
+                    mkdir -p /var/log/sc0710
+                    sc0710_init_firmware_paths
+                    if sc0710_card_bound || sc0710_cli_ensure_ecp5 3; then
+                        echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
+                    else
+                        echo -e "${RED}[ERROR]${NC} Driver loaded but ECP5 programming failed."
+                        echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                        exit 1
+                    fi
+                else
+                    echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
+                fi
+            elif [[ ! -f "$SRC_DIR/build/${DRV_NAME}.ko" ]]; then
+                echo -e "${RED}[ERROR]${NC} Module not found. Run ${BOLD}sc0710-cli --rebuild${NC} first."
+            else
+                echo -e "${RED}[ERROR]${NC} Failed to load driver. Run ${BOLD}sc0710-cli --rebuild${NC} if kernel was updated."
+                echo -e "  Check: ${BOLD}journalctl -u sc0710-build.service -b${NC}"
+            fi
+        else
+            for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do
+                modprobe "$dep" 2>/dev/null || true
+            done
+            if modprobe "$DRV_NAME"; then
+                if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                    if sc0710_cli_ensure_ecp5 3; then
+                        echo -e "${GREEN}[OK]${NC} Driver loaded and ECP5 FPGA programmed."
+                    else
+                        echo -e "${RED}[ERROR]${NC} Driver loaded but ECP5 programming failed."
+                        echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                        exit 1
+                    fi
+                else
+                    echo -e "${GREEN}[OK]${NC} Driver loaded successfully."
+                fi
+            else
+                echo -e "${RED}[ERROR]${NC} Failed to load driver."
+            fi
+        fi
+        ;;
+    -u|--unload)
+        if ! lsmod | grep -q "$DRV_NAME"; then
+            echo -e "${GREEN}[OK]${NC} Driver is not loaded."
+            exit 0
+        fi
+        echo -e "${BLUE}::${NC} Unloading driver..."
+
+        if rmmod "$DRV_NAME" 2>/dev/null; then
+            echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
+            exit 0
+        fi
+
+        echo -e "${YELLOW}[BUSY]${NC} Module is in use. Stopping PipeWire and consumers..."
+        # A plain kill is not enough: systemd restarts the session manager
+        # within a second and it re-grabs the card's nodes before the rmmod
+        # retry. Stop the user services first - BOTH sockets, or any client
+        # touching the pulse socket resurrects the whole stack (wireplumber
+        # is WantedBy=pipewire.service) - and restart them once unloaded.
+        PW_UIDS=()
+        while read -r pid; do
+            uid=$(stat -c %u "/proc/$pid" 2>/dev/null) || continue
+            PW_UIDS+=("$uid")
+        done < <(pgrep -x pipewire 2>/dev/null || true)
+        for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
+            sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                systemctl --user stop pipewire.socket pipewire-pulse.socket \
+                    pipewire.service pipewire-pulse.service wireplumber.service || true
+        done
+
+        # Target only THIS driver's video nodes, never the whole of
+        # /dev/video* (holders of webcams etc. are unrelated apps).
+        VID_NODES=()
+        for v in /sys/class/video4linux/video*; do
+            [[ -e "$v" ]] || continue
+            if [[ "$(readlink "$v/device/driver" 2>/dev/null)" == */"$DRV_NAME" ]]; then
+                VID_NODES+=("/dev/$(basename "$v")")
+            fi
+        done
+
+        # The card holds ALSA nodes too; target only THIS card's sound
+        # devices, never the whole of /dev/snd (holders of other cards are
+        # the desktop's audio stack).
+        SND_NODES=()
+        CARD_LINK=$(readlink "/proc/asound/$DRV_NAME" 2>/dev/null || true)
+        if [[ "$CARD_LINK" == card* ]]; then
+            N="${CARD_LINK#card}"
+            SND_NODES=(/dev/snd/pcmC"$N"D* /dev/snd/controlC"$N")
+        fi
+        fuser -k "${VID_NODES[@]}" "${SND_NODES[@]}" >/dev/null 2>&1 || true
+        sleep 1
+
+        if ! rmmod "$DRV_NAME" 2>/dev/null; then
+            sleep 2
+            if ! rmmod "$DRV_NAME" 2>/dev/null; then
+                # Never rmmod -f: force-unloading under an open capture fd
+                # is a guaranteed kernel panic, not a recovery.
+                echo -e "${RED}[ERROR]${NC} Module is still in use; close these and retry:"
+                fuser -v "${VID_NODES[@]}" "${SND_NODES[@]}" 2>&1 || true
+                for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
+                    sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                        systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null || true
+                done
+                exit 1
+            fi
+        fi
+        echo -e "${GREEN}[OK]${NC} Driver unloaded successfully."
+        if [[ ${#PW_UIDS[@]} -gt 0 ]]; then
+            echo -e "${BLUE}[INFO]${NC} Restarting PipeWire..."
+            for uid in $(printf '%s\n' "${PW_UIDS[@]}" | sort -u); do
+                sudo -u "#$uid" XDG_RUNTIME_DIR="/run/user/$uid" \
+                    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                    systemctl --user start pipewire.socket pipewire-pulse.socket 2>/dev/null || true
+            done
+        fi
+        ;;
+    --restart)
+        # Always a real unload+load, even when the card is bound and healthy:
+        # a reload is how new firmware/EDID files and module params get picked
+        # up. --load re-verifies the ECP5 on the 4K Pro afterwards.
+        "$0" --unload
+        sleep 1
+        exec "$0" --load
+        ;;
+    -s|--status)
+        check_version
+        echo -e "${BLUE}::${NC} ${BOLD}Install Method${NC}"
+        INSTALL_METHOD="$(sc0710_detect_install_method)"
+        case "$INSTALL_METHOD" in
+            AUR*)
+                echo -e "   ${GREEN}●${NC} ${INSTALL_METHOD}"
+                ;;
+            GitHub*)
+                echo -e "   ${GREEN}●${NC} ${INSTALL_METHOD}"
+                ;;
+            Development*)
+                echo -e "   ${YELLOW}●${NC} ${INSTALL_METHOD}"
+                ;;
+            *)
+                echo -e "   ${YELLOW}○${NC} ${INSTALL_METHOD}"
+                ;;
+        esac
+        echo ""
+        if [[ "$IS_ATOMIC" == "true" ]]; then
+            echo -e "${BLUE}::${NC} ${BOLD}System Type${NC}"
+            is_steamos && echo -e "   SteamOS (boot-time build, source in ${SC0710_STEAMOS_HOME})" \
+                       || echo -e "   Atomic/Immutable (boot-time build)"
+            if [[ -f "$SRC_DIR/.built-for-kernel" ]]; then
+                echo -e "   Last built for: ${BOLD}$(cat "$SRC_DIR/.built-for-kernel")${NC}"
+            fi
+            echo -e "   Running kernel:  ${BOLD}$(uname -r)${NC}"
+            echo ""
+            echo -e "${BLUE}::${NC} ${BOLD}Systemd Service${NC}"
+            if systemctl is-enabled sc0710-build.service >/dev/null 2>&1; then
+                echo -e "   ${GREEN}●${NC} sc0710-build.service is enabled"
+            else
+                echo -e "   ${RED}○${NC} sc0710-build.service is disabled"
+            fi
+            if systemctl is-active sc0710-build.service >/dev/null 2>&1; then
+                echo -e "   ${GREEN}●${NC} Last boot build: succeeded"
+            else
+                echo -e "   ${YELLOW}○${NC} Last boot build: not run or failed"
+            fi
+        else
+            echo -e "${BLUE}::${NC} ${BOLD}DKMS Status${NC}"
+            dkms status "$DRV_NAME" 2>/dev/null || echo "   DKMS not configured for this driver."
+        fi
+        echo ""
+        echo -e "${BLUE}::${NC} ${BOLD}Kernel Module${NC}"
+        if lsmod | grep -q "$DRV_NAME"; then
+            echo -e "   ${GREEN}●${NC} Module is loaded"
+            MOD_INFO=$(lsmod | grep "$DRV_NAME" | head -1)
+            MOD_SIZE=$(echo "$MOD_INFO" | awk '{print $2}')
+            MOD_USED=$(echo "$MOD_INFO" | awk '{print $3}')
+            echo "   Size: $MOD_SIZE bytes, Reference count: $MOD_USED"
+            if [[ "$MOD_USED" -gt 0 ]]; then
+                PIDS=""
+                for vdev in /dev/video*; do
+                    if [[ -e "$vdev" ]]; then
+                        DEVPIDS=$(fuser "$vdev" 2>/dev/null | tr -s ' ')
+                        [[ -n "$DEVPIDS" ]] && PIDS="$PIDS $DEVPIDS"
+                    fi
+                done
+                for sdev in /dev/snd/*; do
+                    if [[ -e "$sdev" ]]; then
+                        DEVPIDS=$(fuser "$sdev" 2>/dev/null | tr -s ' ')
+                        [[ -n "$DEVPIDS" ]] && PIDS="$PIDS $DEVPIDS"
+                    fi
+                done
+                if [[ -n "$PIDS" ]]; then
+                    echo -e "   ${YELLOW}Processes holding device open:${NC}"
+                    echo "$PIDS" | tr ' ' '\n' | sort -un | while read -r pid; do
+                        [[ -n "$pid" && -f "/proc/$pid/comm" ]] && echo -e "     PID ${BOLD}$pid${NC} - $(cat /proc/$pid/comm 2>/dev/null)"
+                    done
+                else
+                    echo -e "   ${YELLOW}No open device handles found (kernel-internal reference?)${NC}"
+                fi
+            fi
+        else
+            echo -e "   ${RED}○${NC} Module is not loaded"
+        fi
+        echo ""
+        # Card Information (shared)
+        echo -e "${BLUE}::${NC} ${BOLD}Card Information${NC}"
+        if lsmod | grep -q "$DRV_NAME"; then
+            FOUND_CARDS=0
+            for pcidir in /sys/bus/pci/drivers/sc0710/0*; do
+                if [[ -d "$pcidir" ]]; then
+                    FOUND_CARDS=1
+                    PCI_ADDR=$(basename "$pcidir")
+                    SUBVEN=$(cat "$pcidir/subsystem_vendor" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//')
+                    SUBDEV=$(cat "$pcidir/subsystem_device" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//')
+                    VEN=$(cat "$pcidir/vendor" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//')
+                    DEV=$(cat "$pcidir/device" 2>/dev/null | grep -iE '0x[0-9a-f]+' -o | sed 's/0x//')
+                    BOARD_NAME=$(dmesg 2>/dev/null | grep -E "sc0710.*subsystem: ${SUBVEN}:${SUBDEV}.*board:" | tail -1 | sed 's/.*board: \([^\[]*\).*/\1/' | sed 's/ *$//')
+                    if [[ -z "$BOARD_NAME" ]]; then
+                        if fw_lib=$(sc0710_firmware_lib_path 2>/dev/null); then
+                            # shellcheck source=/dev/null
+                            source "$fw_lib"
+                            BOARD_NAME=$(sc0710_board_name_from_subsys "${SUBVEN}:${SUBDEV}")
+                        else
+                            case "$SUBVEN:$SUBDEV" in
+                                1cfa:000e) BOARD_NAME="Elgato 4K60 Pro MK.2" ;;
+                                1cfa:0012) BOARD_NAME="Elgato 4K Pro" ;;
+                                1cfa:0006) BOARD_NAME="Elgato HD60 Pro (1cfa:0006)" ;;
+                                *) BOARD_NAME="UNKNOWN/GENERIC" ;;
+                            esac
+                        fi
+                    fi
+                    echo -e "   ${GREEN}●${NC} Device at PCI ${BOLD}${PCI_ADDR}${NC}"
+                    echo -e "     Board: ${BOARD_NAME}"
+                    echo -e "     Hardware: ${VEN}:${DEV} (Subsys: ${SUBVEN}:${SUBDEV})"
+                    if [[ "$SUBVEN:$SUBDEV" == "1cfa:0006" ]]; then
+                        echo -e "     ${RED}⚠ WARNING:${NC} This is an Elgato HD60 Pro."
+                        echo -e "     ${RED}          ${NC} It is an entirely different chipset and is ${BOLD}INCOMPATIBLE${NC} with this driver."
+                    fi
+                fi
+            done
+            [[ $FOUND_CARDS -eq 0 ]] && echo -e "   ${YELLOW}○${NC} No devices found currently bound to driver"
+        else
+            echo -e "   ${RED}○${NC} Module is not loaded, cannot retrieve card info"
+        fi
+        # Signal Status, Scaler, Debug, Status Images, Timing, ECP5 (shared - use source from atomic as base)
+        echo ""
+        echo -e "${BLUE}::${NC} ${BOLD}Signal Status${NC}"
+        if [[ -f /proc/sc0710-state ]]; then
+            PROC_INFO=$(cat /proc/sc0710-state 2>/dev/null)
+            HDMI_LINE=$(echo "$PROC_INFO" | grep "HDMI:" | head -1)
+            if [[ -n "$HDMI_LINE" ]]; then
+                if echo "$HDMI_LINE" | grep -q "no signal"; then
+                    echo -e "   ${YELLOW}○${NC} No signal detected"
+                else
+                    FMT_NAME=$(echo "$HDMI_LINE" | sed 's/.*HDMI: \([^ ]*\).*/\1/')
+                    RESOLUTION=$(echo "$HDMI_LINE" | sed 's/.*-- \([^ ]*\).*/\1/')
+                    TIMING=$(echo "$HDMI_LINE" | grep -oP '\([0-9]+x[0-9]+\)' | tr -d '()')
+                    echo -e "   ${GREEN}●${NC} Signal locked"
+                    echo -e "   Format: ${BOLD}${FMT_NAME}${NC}"
+                    [[ -n "$RESOLUTION" && "$RESOLUTION" != "$HDMI_LINE" ]] && echo -e "   Resolution: ${RESOLUTION}"
+                    [[ -n "$TIMING" ]] && echo -e "   Total timing: ${TIMING}"
+                fi
+            else
+                echo -e "   ${RED}○${NC} Could not read HDMI status"
+            fi
+        else
+            LAST_FMT=$(dmesg 2>/dev/null | grep -E "sc0710.*Detected timing|sc0710.*DTC created" | tail -1)
+            if [[ -n "$LAST_FMT" ]]; then
+                echo -e "   Last detected: $(echo "$LAST_FMT" | sed 's/.*sc0710[^:]*: //')"
+            else
+                echo -e "   ${RED}○${NC} No signal info available (check dmesg)"
+            fi
+        fi
+        echo ""
+        echo -e "${BLUE}::${NC} ${BOLD}Debug Mode${NC}"
+        DBG_PATH=""
+        [[ -f /sys/module/sc0710/parameters/sc0710_debug_mode ]] && DBG_PATH=/sys/module/sc0710/parameters/sc0710_debug_mode
+        [[ -f /sys/module/sc0710/parameters/debug ]] && DBG_PATH=/sys/module/sc0710/parameters/debug
+        if [[ -n "$DBG_PATH" ]]; then
+            DBG_STATE=$(cat "$DBG_PATH")
+            [[ "$DBG_STATE" == "1" ]] && echo -e "   ${YELLOW}●${NC} Debug mode enabled" || echo -e "   ${GREEN}○${NC} Debug mode disabled"
+        else
+            echo -e "   ${RED}○${NC} Parameter not available (module not loaded)"
+        fi
+        echo ""
+        echo -e "${BLUE}::${NC} ${BOLD}Status Images${NC}"
+        if [[ -f /sys/module/sc0710/parameters/use_status_images ]]; then
+            [[ "$(cat /sys/module/sc0710/parameters/use_status_images)" == "1" ]] && echo -e "   ${GREEN}●${NC} Status images enabled" || echo -e "   ${YELLOW}○${NC} Status images disabled"
+        else
+            echo -e "   ${RED}○${NC} Parameter not available (module not loaded)"
+        fi
+        echo ""
+        echo -e "${BLUE}::${NC} ${BOLD}Timing Calculation${NC}"
+        if [[ -f /sys/module/sc0710/parameters/procedural_timings ]]; then
+            PT_STATE=$(cat /sys/module/sc0710/parameters/procedural_timings 2>/dev/null || echo 0)
+            case "$PT_STATE" in 1) echo -e "   ${YELLOW}●${NC} PROCEDURAL_ONLY";; 2) echo -e "   ${YELLOW}●${NC} STATIC_ONLY";; *) echo -e "   ${GREEN}●${NC} MERGE";; esac
+        elif [[ -f /proc/sc0710-state ]]; then
+            PT_LINE=$(grep "^ timing calc:" /proc/sc0710-state 2>/dev/null | head -1)
+            [[ -n "$PT_LINE" ]] && echo -e "   ${YELLOW}●${NC}${PT_LINE# timing calc: }" || echo -e "   ${RED}○${NC} Parameter not available"
+        else
+            echo -e "   ${RED}○${NC} Parameter not available (module not loaded)"
+        fi
+        # ECP5 Firmware Status
+        if sc0710_is_4k_pro_card; then
+            echo ""
+            echo -e "${BLUE}::${NC} ${BOLD}ECP5 Firmware${NC}"
+            FW_FOUND=false
+            for p in /var/lib/sc0710/firmware/SC0710.FWI.HEX /etc/firmware/sc0710/SC0710.FWI.HEX /lib/firmware/sc0710/SC0710.FWI.HEX; do
+                if [[ -f "$p" ]]; then FW_FOUND=true; echo -e "   ${GREEN}●${NC} Firmware present: $p"; break; fi
+            done
+            [[ "$FW_FOUND" == "false" ]] && echo -e "   ${RED}○${NC} Firmware missing. Run: ${BOLD}sudo bash $(sc0710_extract_script_path)${NC}"
+            # The driver fails its probe when the ECP5 can't be programmed, so
+            # bind state is the FPGA state — no kernel-log parsing.
+            if ls /sys/bus/pci/drivers/${DRV_NAME}/0000:* >/dev/null 2>&1; then
+                echo -e "   ${GREEN}●${NC} Driver bound — ECP5 FPGA programmed"
+            elif lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+                echo -e "   ${RED}○${NC} Driver loaded but card NOT bound — probe failed (ECP5/firmware)."
+                echo -e "     Check: ${BOLD}sudo dmesg | grep sc0710${NC}"
+                echo -e "     Then:  ${BOLD}sc0710-cli --restart${NC}"
+            else
+                echo -e "   ${YELLOW}○${NC} Driver not loaded"
+            fi
+        fi
+        echo ""
+        ;;
+    -d|--debug)
+        DBG_PATH=""
+        [[ -f /sys/module/sc0710/parameters/sc0710_debug_mode ]] && DBG_PATH=/sys/module/sc0710/parameters/sc0710_debug_mode
+        [[ -f /sys/module/sc0710/parameters/debug ]] && DBG_PATH=/sys/module/sc0710/parameters/debug
+        if [[ -z "$DBG_PATH" ]]; then
+            echo -e "${RED}[ERROR]${NC} Module not loaded. Load it first with: sc0710-cli --load"
+            exit 1
+        fi
+        CURRENT=$(cat "$DBG_PATH")
+        if [[ "$CURRENT" == "1" ]]; then
+            echo 0 > "$DBG_PATH"
+            echo -e "${GREEN}[OK]${NC} Debug mode disabled"
+        else
+            echo 1 > "$DBG_PATH"
+            echo -e "${YELLOW}[OK]${NC} Debug mode enabled"
+        fi
+        save_config
+        ;;
+    -ht|--hdr-toggle)
+        if [[ ! -f /sys/module/sc0710/parameters/hdr_bgr24 ]] ||
+           [[ ! -f /sys/module/sc0710/parameters/sw_tonemap ]]; then
+            LIVE=$(cat /sys/module/sc0710/version 2>/dev/null || echo "not loaded")
+            echo -e "${RED}[ERROR]${NC} HDR controls missing (need hdr_bgr24/sw_tonemap)."
+            echo -e "  Running module: ${BOLD}${LIVE}${NC} (package tree: ${CURRENT_VERSION:-unknown})"
+            echo -e "  Reload the new build: ${BOLD}sc0710-cli --restart${NC}"
+            exit 1
+        fi
+        BGR=$(cat /sys/module/sc0710/parameters/hdr_bgr24)
+        TM=$(cat /sys/module/sc0710/parameters/sw_tonemap)
+        # tonemap preview (bgr ignored/0, tm=1) → passthrough → SDR-only → tonemap
+        if [[ "$TM" == "1" ]]; then
+            echo 1 > /sys/module/sc0710/parameters/hdr_bgr24
+            echo 0 > /sys/module/sc0710/parameters/sw_tonemap
+            echo -e "${GREEN}[OK]${NC} HDR passthrough — BGR24 + PQ/BT.2020 when HDMI is HDR (no SW tonemap)"
+        elif [[ "$BGR" == "1" && "$TM" == "0" ]]; then
+            echo 0 > /sys/module/sc0710/parameters/hdr_bgr24
+            echo 0 > /sys/module/sc0710/parameters/sw_tonemap
+            echo -e "${YELLOW}[OK]${NC} SDR-only — leave YUYV (no BGR24 prefer, no tonemap)"
+        else
+            echo 0 > /sys/module/sc0710/parameters/hdr_bgr24
+            echo 1 > /sys/module/sc0710/parameters/sw_tonemap
+            echo -e "${GREEN}[OK]${NC} Tonemap preview — host tonemap when HDMI is HDR-PQ (YUYV or BGR24)"
+        fi
+        if [[ -r /proc/sc0710-state ]]; then
+            grep -E 'HDMI|color_deep|eotf|deliver|mode=' /proc/sc0710-state 2>/dev/null || true
+        fi
+        ;;
+    --hdr-test)
+        sc0710_hdr_self_test
+        ;;
+    --hdr-hw-test)
+        sc0710_hdr_hw_ab_test
+        ;;
+    -it|--image-toggle)
+        if [[ ! -f /sys/module/sc0710/parameters/use_status_images ]]; then
+            echo -e "${RED}[ERROR]${NC} Module not loaded. Load it first with: sc0710-cli --load"
+            exit 1
+        fi
+        CURRENT=$(cat /sys/module/sc0710/parameters/use_status_images)
+        if [[ "$CURRENT" == "1" ]]; then
+            echo 0 > /sys/module/sc0710/parameters/use_status_images
+            echo -e "${YELLOW}[OK]${NC} Status images disabled"
+        else
+            echo 1 > /sys/module/sc0710/parameters/use_status_images
+            echo -e "${GREEN}[OK]${NC} Status images enabled"
+        fi
+        save_config
+        ;;
+    -kaa|--keep-audio-alive)
+        if [[ ! -f /sys/module/sc0710/parameters/keep_audio_alive ]]; then
+            echo -e "${RED}[ERROR]${NC} keep_audio_alive parameter not available. Load the driver first with: sc0710-cli --load"
+            exit 1
+        fi
+        CURRENT=$(cat /sys/module/sc0710/parameters/keep_audio_alive)
+        if [[ "${CURRENT:-0}" == "0" ]]; then
+            echo 1 > /sys/module/sc0710/parameters/keep_audio_alive
+            echo -e "${GREEN}[OK]${NC} Keep-audio-alive enabled - the card's audio input stays active without a video capture client"
+        else
+            echo 0 > /sys/module/sc0710/parameters/keep_audio_alive
+            echo -e "${YELLOW}[OK]${NC} Keep-audio-alive disabled - audio follows video streaming (default)"
+        fi
+        echo -e "${BLUE}[NOTE]${NC} Takes effect the next time an audio client opens the capture device."
+        save_config
+        ;;
+    -pt|--procedural-timings)
+        if [[ ! -f /sys/module/sc0710/parameters/procedural_timings ]]; then
+            echo -e "${RED}[ERROR]${NC} procedural_timings parameter not available."
+            exit 1
+        fi
+        CURRENT=$(cat /sys/module/sc0710/parameters/procedural_timings)
+        case "${CURRENT:-0}" in
+            0) echo 1 > /sys/module/sc0710/parameters/procedural_timings; echo -e "${YELLOW}[OK]${NC} PROCEDURAL_ONLY" ;;
+            1) echo 2 > /sys/module/sc0710/parameters/procedural_timings; echo -e "${YELLOW}[OK]${NC} STATIC_ONLY" ;;
+            *) echo 0 > /sys/module/sc0710/parameters/procedural_timings; echo -e "${GREEN}[OK]${NC} MERGE" ;;
+        esac
+        save_config
+        ;;
+    -U|--update)
+        echo -e "${BLUE}::${NC} Checking for updates..."
+        if [[ "$IS_ATOMIC" == "true" ]]; then
+            [[ ! -d "$SRC_DIR" ]] && { echo -e "${RED}[ERROR]${NC} Source directory missing."; exit 1; }
+            TEMP_TAR=$(mktemp /tmp/sc0710-update.XXXXXX.tar.gz)
+            curl -fsSL "https://github.com/Nakildias/sc0710/archive/refs/heads/main.tar.gz" -o "$TEMP_TAR" || { echo -e "${RED}[ERROR]${NC} Download failed."; rm -f "$TEMP_TAR"; exit 1; }
+            tar -xzf "$TEMP_TAR" --strip-components=1 -C "$SRC_DIR" || { rm -f "$TEMP_TAR"; exit 1; }
+            rm -f "$TEMP_TAR"
+            [[ -f "$SRC_DIR/scripts/build-and-load.sh" ]] && cp "$SRC_DIR/scripts/build-and-load.sh" "$SRC_DIR/build-and-load.sh" && chmod +x "$SRC_DIR/build-and-load.sh"
+            [[ -f "$SRC_DIR/scripts/sc0710-firmware-lib.sh" ]] && cp "$SRC_DIR/scripts/sc0710-firmware-lib.sh" "$SRC_DIR/sc0710-firmware-lib.sh" && chmod +x "$SRC_DIR/sc0710-firmware-lib.sh"
+            # The boot service sources this out of the tree root, so it has to
+            # be refreshed alongside the others.
+            [[ -f "$SRC_DIR/scripts/sc0710-steamos-lib.sh" ]] && cp "$SRC_DIR/scripts/sc0710-steamos-lib.sh" "$SRC_DIR/sc0710-steamos-lib.sh" && chmod +x "$SRC_DIR/sc0710-steamos-lib.sh"
+            if is_steamos; then
+                sc0710_steamos_install_tools "$SRC_DIR" || \
+                    echo -e "${YELLOW}[WARNING]${NC} Could not refresh the sc0710 tools in /usr/local/bin."
+            fi
+            NEW_VER="$CURRENT_VERSION"
+            [[ -f "$SRC_DIR/version" ]] && NEW_VER=$(cat "$SRC_DIR/version" | tr -d '[:space:]')
+            lsmod | grep -q "$DRV_NAME" && "$0" --unload
+            rm -f "$SRC_DIR/.built-for-kernel"
+            cd "$SRC_DIR"
+            make clean 2>/dev/null || true
+            if make KVERSION="$(uname -r)" -j"$(nproc)" 2>&1; then
+                echo "$(uname -r)" > "$SRC_DIR/.built-for-kernel"
+                chcon -t modules_object_t "$SRC_DIR/build/${DRV_NAME}.ko" 2>/dev/null || true
+                for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc videobuf2-dma-sg snd-pcm; do modprobe "$dep" 2>/dev/null || true; done
+                if sc0710_cli_atomic_load; then
+                    if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                        if sc0710_cli_ensure_ecp5 5; then
+                            echo -e "${GREEN}[OK]${NC} Driver updated (v${NEW_VER}), ECP5 FPGA programmed."
+                        else
+                            echo -e "${YELLOW}[WARNING]${NC} Driver updated (v${NEW_VER}) but ECP5 programming failed."
+                            echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                        fi
+                    else
+                        echo -e "${GREEN}[OK]${NC} Driver updated (v${NEW_VER})."
+                    fi
+                else
+                    echo -e "${YELLOW}[WARNING]${NC} Try: sc0710-cli --load"
+                    [[ ! -f "$SRC_DIR/build/${DRV_NAME}.ko" ]] && echo -e "   ${YELLOW}If module doesn't exist, please reinstall using:${NC}" && echo -e "   sudo bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Nakildias/sc0710/main/scripts/install-sc0710.sh)\""
+                fi
+            else
+                echo -e "${RED}[ERROR]${NC} Build failed."
+                exit 1
+            fi
+        else
+            # Best fix: Safely stage files in a temporary directory instead of extracting over the old source
+            TEMP_DIR=$(mktemp -d /tmp/sc0710-update.XXXXXX)
+            TEMP_TAR="$TEMP_DIR/main.tar.gz"
+            
+            curl -fsSL "https://github.com/Nakildias/sc0710/archive/refs/heads/main.tar.gz" -o "$TEMP_TAR" || { rm -rf "$TEMP_DIR"; exit 1; }
+            tar -xzf "$TEMP_TAR" --strip-components=1 -C "$TEMP_DIR" || { rm -rf "$TEMP_DIR"; exit 1; }
+            rm -f "$TEMP_TAR"
+            
+            REAL_NEW_VER=$(cat "$TEMP_DIR/version" | tr -d '[:space:]')
+            NEW_DKMS_VER=$(sc0710_version_to_dkms "$REAL_NEW_VER")
+
+            lsmod | grep -q "$DRV_NAME" && "$0" --unload
+            sc0710_dkms_run_cleanup
+            NEW_DKMS_SRC="/usr/src/${DRV_NAME}-${NEW_DKMS_VER}"
+
+            mv "$TEMP_DIR" "$NEW_DKMS_SRC"
+
+            dkms add -m "$DRV_NAME" -v "$NEW_DKMS_VER" >/dev/null 2>&1
+            if dkms install -m "$DRV_NAME" -v "$NEW_DKMS_VER" -k "$(uname -r)" --force 2>&1; then
+                # Refresh the installed firmware lib alongside the driver (the
+                # atomic branch does the same); only if it was installed before.
+                if [[ -f /usr/local/libexec/sc0710-firmware-lib.sh && -f "$NEW_DKMS_SRC/scripts/sc0710-firmware-lib.sh" ]]; then
+                    cp "$NEW_DKMS_SRC/scripts/sc0710-firmware-lib.sh" /usr/local/libexec/sc0710-firmware-lib.sh
+                    chmod +x /usr/local/libexec/sc0710-firmware-lib.sh
+                fi
+                if sc0710_is_4k_pro_card && sc0710_firmware_lib_path >/dev/null; then
+                    if sc0710_cli_ensure_ecp5 5; then
+                        echo -e "${GREEN}[OK]${NC} Driver updated (v${REAL_NEW_VER}), ECP5 FPGA programmed."
+                    else
+                        echo -e "${YELLOW}[WARNING]${NC} Driver updated (v${REAL_NEW_VER}) but ECP5 programming failed."
+                        echo -e "  Run: ${BOLD}sc0710-cli --restart${NC}"
+                    fi
+                else
+                    echo -e "${GREEN}[OK]${NC} Driver updated (v${REAL_NEW_VER})."
+                fi
+            else
+                echo -e "${RED}[ERROR]${NC} DKMS rebuild failed."
+                exit 1
+            fi
+            modprobe "$DRV_NAME" 2>/dev/null || echo -e "${YELLOW}[WARNING]${NC} Try: sc0710-cli --load"
+        fi
+        ;;
+    --rebuild)
+        if [[ "$IS_ATOMIC" != "true" ]]; then
+            echo -e "${RED}[ERROR]${NC} --rebuild is only supported on Atomic/SteamOS installs. Use --update instead."
+            exit 1
+        fi
+        echo -e "${BLUE}::${NC} Forcing module rebuild..."
+        lsmod | grep -q "$DRV_NAME" && rmmod "$DRV_NAME" 2>/dev/null || true
+        rm -f "$SRC_DIR/.built-for-kernel"
+        (cd "$SRC_DIR" && bash "$SRC_DIR/build-and-load.sh") && echo -e "${GREEN}[OK]${NC} Module rebuilt." || { echo -e "${RED}[ERROR]${NC} Rebuild failed."; exit 1; }
+        ;;
+    -r|-R|--remove)
+        echo -e "${BLUE}::${NC} Uninstalling driver and utility..."
+        read -r -p "Do you want to unload the driver? [Y/n] " UNLOAD_RESP
+        [[ -z "$UNLOAD_RESP" || "$UNLOAD_RESP" =~ ^[yY] ]] && "$0" --unload
+
+        if AUR_PKG=$(sc0710_installed_aur_package); then
+            sc0710_cli_remove_aur_install "$AUR_PKG"
+            exit $?
+        fi
+
+        if [[ "$IS_ATOMIC" == "true" ]]; then
+            systemctl stop sc0710-build.service 2>/dev/null || true
+            systemctl disable sc0710-build.service 2>/dev/null || true
+            rm -f /etc/systemd/system/sc0710-build.service
+            systemctl daemon-reload
+            sc0710_cli_clear_stale_registration
+            if is_steamos; then
+                # $SRC_DIR is a symlink into /home; removing it alone would
+                # leave the whole driver tree (and the source) behind.
+                rm -rf "${SC0710_STEAMOS_HOME:?}"
+                rm -f /var/lib/sc0710
+                echo -e "  ${YELLOW}NOTE:${NC} Packages installed with pacman (kernel headers, base-devel) were left in place."
+            else
+                rm -rf "$SRC_DIR"
+                echo -e "  ${YELLOW}NOTE:${NC} Layered build packages were left unchanged (no rpm-ostree changes, no reboot needed)."
+            fi
+        else
+            sc0710_dkms_run_cleanup
+        fi
+        sc0710_cli_remove_user_state
+        rm -f /usr/local/bin/sc0710-cli
+        # EDID / HDR tooling installed alongside the CLI
+        rm -f /usr/local/bin/sc0710-edid-config /usr/local/bin/sc0710-hdr-config \
+            /usr/local/bin/mk2-set-edid /usr/local/bin/mk2-set-tonemap
+        rm -rf /usr/share/sc0710/edid
+
+        if [[ -x /usr/bin/sc0710-cli ]] || \
+            pacman -Q sc0710-dkms-git &>/dev/null || \
+            pacman -Q sc0710-dkms &>/dev/null; then
+            echo -e "${YELLOW}[WARNING]${NC} AUR package files are still installed."
+            if AUR_PKG=$(sc0710_installed_aur_package); then
+                echo -e "  Attempting package removal via AUR helper..."
+                sc0710_cli_remove_aur_install "$AUR_PKG"
+                exit $?
+            fi
+            echo -e "  Run: ${BOLD}yay -R sc0710-dkms-git${NC} or ${BOLD}sudo pacman -R sc0710-dkms-git${NC}"
+            exit 1
+        fi
+
+        echo -e "${GREEN}[OK]${NC} Driver, CLI, services, and firmware removed."
+        ;;
+    --dump)
+        write_debug_dump
+        ;;
+    --verdict)
+        # Same analysis the dump leads with, straight to the terminal, so
+        # "is my slot the problem?" is answerable without a file.
+        sc0710_pcie_verdict
+        ;;
+    --rate-decode)
+        # Reload with a specific refresh-rate decoding and show the result.
+        # The parameter only takes effect at load time (the rate is derived
+        # behind the timing-change path), so this always reloads.
+        case "$2" in
+            0|1|2) ;;
+            *)
+                echo -e "${RED}error:${NC} --rate-decode needs 0, 1 or 2"
+                echo "  0 = legacy (3600/byte, with the 120Hz special case)"
+                echo "  1 = the byte is the refresh rate"
+                echo "  2 = the byte is a period (3600/byte)"
+                exit 1
+                ;;
+        esac
+        if [[ ! -e /sys/module/sc0710/parameters/hdmi_rate_decode ]] && \
+           lsmod | grep -q "^${DRV_NAME}[[:space:]]"; then
+            echo -e "${YELLOW}[WARNING]${NC} The loaded module has no hdmi_rate_decode parameter."
+            echo -e "  It predates this CLI; rebuild and reinstall from this source tree first."
+            exit 1
+        fi
+        "$0" --unload
+        echo -e "${BLUE}::${NC} Loading with hdmi_rate_decode=$2..."
+        if ! modprobe "$DRV_NAME" "hdmi_rate_decode=$2"; then
+            echo -e "${RED}[ERROR]${NC} Load failed."
+            exit 1
+        fi
+        # An unknown parameter is only ever reported to the kernel log.
+        if dmesg 2>/dev/null | tail -40 | grep -q "unknown parameter"; then
+            echo -e "${YELLOW}[WARNING]${NC} The kernel ignored a parameter:"
+            dmesg | grep "unknown parameter" | tail -3 | sed 's/^/  /'
+        fi
+        sleep 1
+        echo ""
+        sc0710_pcie_verdict
+        ;;
+    -v|--version)
+        echo -e "${BOLD}SC0710${NC} Driver Control Utility$(sc0710_edition_label)"
+        echo -e "Version: ${BOLD}${CURRENT_VERSION}${NC}"
+        check_version
+        ;;
+    -h|--help)
+        show_help
+        ;;
+    *)
+        echo -e "${RED}error:${NC} Unknown option '$1'"
+        echo -e "Use ${BOLD}-h${NC} or ${BOLD}--help${NC} for usage information."
+        exit 1
+        ;;
+esac

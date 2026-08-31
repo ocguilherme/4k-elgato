@@ -1,0 +1,177 @@
+#!/bin/bash
+
+# 4K Pro detection and card naming use /usr/lib/sc0710/sc0710-firmware-lib.sh
+
+DRV_NAME="sc0710"
+FW_LIB="/usr/lib/sc0710/sc0710-firmware-lib.sh"
+EXTRACT_SCRIPT="/usr/lib/sc0710/extract-firmware.sh"
+FIRMWARE_FILE="SC0710.FWI.HEX"
+
+is_4k_pro() {
+    if [[ -f "$FW_LIB" ]]; then
+        # shellcheck source=/dev/null
+        source "$FW_LIB"
+        sc0710_is_4k_pro
+        return $?
+    fi
+    lspci -n -v -d 12ab:0710 2>/dev/null | grep -qi "1cfa:0012"
+}
+
+detect_card_name() {
+    if [[ -f "$FW_LIB" ]]; then
+        # shellcheck source=/dev/null
+        source "$FW_LIB"
+        sc0710_detect_card_name
+        return $?
+    fi
+    return 1
+}
+
+print_mk2_next_steps() {
+    echo "To load the module now:"
+    echo "  sudo modprobe sc0710"
+    echo ""
+    echo "Optional boot load:"
+    echo "  echo sc0710 | sudo tee /etc/modules-load.d/sc0710.conf"
+    echo ""
+    echo "Then check status:"
+    echo "  sc0710-cli --status"
+}
+
+print_4k_pro_next_steps() {
+    echo "4K Pro — the driver programs the ECP5 FPGA when it loads, and refuses"
+    echo "to bind the card if it can't (missing firmware file, upload failure)."
+    echo ""
+    echo "Check driver and firmware status:"
+    echo "  sc0710-cli --status"
+    echo ""
+    echo "If the card didn't bind (no /dev/video*):"
+    echo "  sudo dmesg | grep sc0710       (shows why the probe failed)"
+    echo "  sudo bash /usr/lib/sc0710/extract-firmware.sh   (if firmware is missing)"
+    echo "  sudo sc0710-cli --restart"
+}
+
+firmware_present() {
+    [[ -f "/lib/firmware/sc0710/$FIRMWARE_FILE" ]] || \
+    [[ -f "/etc/firmware/sc0710/$FIRMWARE_FILE" ]] || \
+    [[ -f "/var/lib/sc0710/firmware/$FIRMWARE_FILE" ]]
+}
+
+setup_modprobe_boot() {
+    if [[ ! -f "/etc/modules-load.d/${DRV_NAME}.conf" ]]; then
+        echo "$DRV_NAME" > "/etc/modules-load.d/${DRV_NAME}.conf"
+    fi
+    if [[ ! -f "/etc/modprobe.d/${DRV_NAME}.conf" ]]; then
+        cat > "/etc/modprobe.d/${DRV_NAME}.conf" <<EOF
+softdep ${DRV_NAME} pre: videodev videobuf2-v4l2 videobuf2-vmalloc videobuf2-common snd-pcm
+EOF
+    fi
+}
+
+setup_4k_pro() {
+    echo "Configuring ECP5 firmware for 4K Pro..."
+
+    if ! firmware_present && [[ -x "$EXTRACT_SCRIPT" ]]; then
+        echo "Extracting ECP5 firmware (requires network)..."
+        if ! bash "$EXTRACT_SCRIPT"; then
+            echo "warning: firmware extraction failed; the driver will refuse to bind the"
+            echo "card until the firmware is installed: sudo bash $EXTRACT_SCRIPT"
+        fi
+    fi
+
+    setup_modprobe_boot
+}
+
+# Older package versions created boot-time firmware units outside the package;
+# the driver programs the ECP5 itself now, so scrub the stale files on upgrade.
+remove_legacy_firmware_units() {
+    local u
+    for u in sc0710-firmware.service sc0710-firmware-verify.service; do
+        systemctl disable --now "$u" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$u"
+    done
+    systemctl daemon-reload 2>/dev/null || true
+}
+
+_dkms_cleanup() {
+    local ver_item
+
+    lsmod | grep -q "^${DRV_NAME} " && rmmod "$DRV_NAME" 2>/dev/null || true
+
+    for ver_item in $(dkms status 2>/dev/null | awk -F'[:,]' "/^${DRV_NAME}/ {print \$1}" | tr -d ' '); do
+        dkms remove "$ver_item" --all >/dev/null 2>&1 || \
+            rm -rf "/var/lib/dkms/$(echo "$ver_item" | tr ',' '/')" 2>/dev/null
+    done
+    rmdir "/var/lib/dkms/${DRV_NAME}" 2>/dev/null || true
+    rm -rf /usr/src/${DRV_NAME}-*
+
+    # Drop stale modules left when an older DKMS version was removed without --all.
+    find /usr/lib/modules -path "*/updates/dkms/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    find /usr/lib/modules -path "*/kernel/drivers/media/pci/${DRV_NAME}.ko*" -delete 2>/dev/null || true
+    depmod -a 2>/dev/null || true
+}
+
+pre_install() {
+    _dkms_cleanup
+}
+
+pre_upgrade() {
+    _dkms_cleanup
+}
+
+post_install_common() {
+    local card_name=""
+
+    echo ""
+    echo "Installed: DKMS module, sc0710-cli, and /usr/lib/sc0710/ firmware helpers."
+    echo ""
+
+    if card_name=$(detect_card_name); then
+        echo "Detected card: ${card_name}"
+    else
+        echo "Detected card: none (no 12ab:0710 device found)"
+    fi
+    echo ""
+    echo "Manage the driver with:"
+    echo "  sc0710-cli --status"
+    echo "  sc0710-cli --help"
+    echo ""
+
+    if is_4k_pro; then
+        setup_4k_pro
+        echo ""
+        print_4k_pro_next_steps
+    else
+        print_mk2_next_steps
+    fi
+}
+
+post_install() {
+    post_install_common
+    _dkms_finalize
+}
+
+post_upgrade() {
+    remove_legacy_firmware_units
+    post_install_common
+    _dkms_finalize
+}
+
+_dkms_finalize() {
+    local lib="/usr/lib/sc0710/sc0710-dkms-lib.sh"
+
+    if [[ -f "$lib" ]]; then
+        # shellcheck source=/dev/null
+        source "$lib"
+        sc0710_dkms_ensure_installed
+    fi
+
+    for dep in videodev videobuf2-common videobuf2-v4l2 videobuf2-vmalloc snd-pcm; do
+        modprobe "$dep" 2>/dev/null || true
+    done
+    modprobe "$DRV_NAME" 2>/dev/null || true
+}
+
+pre_remove() {
+    _dkms_cleanup
+}
